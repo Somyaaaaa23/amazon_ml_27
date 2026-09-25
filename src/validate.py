@@ -111,12 +111,12 @@ def score(cands, preds, gt, s1_ids, evaluate_macro_f05):
 # -----------------------------------------------------------------------------
 # Helpers shared by adapters
 # -----------------------------------------------------------------------------
-def load_modules(code_dir):
+def load_modules(code_dir, names=("normalization", "blocking", "features", "model", "postprocessing")):
     code_dir = os.path.abspath(code_dir)
     for k in [k for k in sys.modules if k == "src" or k.startswith("src.") or k.startswith("utils")]:
         del sys.modules[k]
     sys.path.insert(0, code_dir)
-    mods = {n: importlib.import_module(f"src.{n}") for n in ["normalization", "blocking", "features", "model", "postprocessing"]}
+    mods = {n: importlib.import_module(f"src.{n}") for n in names}
     sys.path.pop(0)
     return mods
 
@@ -325,7 +325,71 @@ def adapter_antigravity(mods, s1, s2, s3, gt, tr, ev, top_k=20, qbatch=25):
     return ev_cands, preds, cv_info
 
 
-ADAPTERS = {"original": adapter_original, "antigravity": adapter_antigravity}
+# -----------------------------------------------------------------------------
+# Adapter: CURRENT pipeline (src/pipeline_core.py in --code-dir).
+# Per country: one index over the full pool (IDF fitted on pool + S1 text, unlabeled), candidates
+# and features for train and eval S1; then one model trained on all training pairs with
+# GroupKFold OOF tuning of the decision rule; eval decided per country (global one-owner).
+# -----------------------------------------------------------------------------
+def adapter_current(mods, s1, s2, s3, gt, tr, ev, **kw):
+    pc = mods["pipeline_core"]
+    views = kw.get("views")
+    tr_n, ev_n = pc.normalize(tr), pc.normalize(ev)
+    tr_key = {k: i for i, k in enumerate(tr_n["entity_id"])}
+    train_parts, eval_parts = [], []
+    offset = 0
+    countries = sorted(set(tr["country"]) | set(ev["country"]))
+    pools = {c: pd.concat([s2[s2["country"] == c], s3[s3["country"] == c]], ignore_index=True) for c in countries}
+    block_stats = {}
+    for c in sorted(pools, key=lambda c: len(pools[c])):
+        pool = pc.normalize(pools.pop(c))
+        tr_c = tr_n[tr_n["country"] == c].reset_index(drop=True)
+        ev_c = ev_n[ev_n["country"] == c].reset_index(drop=True)
+        log(f"current [{c}]: pool {len(pool):,}; building index")
+        idx = pc.CountryIndex(pool, extra=[tr_c, ev_c], views=views)
+        pool_ids = idx.pool["entity_id"].to_numpy()
+        for name, frame, parts in [("train", tr_c, train_parts), ("eval", ev_c, eval_parts)]:
+            if frame.empty:
+                continue
+            pairs = idx.candidates(frame)
+            log(f"current [{c}] {name}: {len(frame):,} S1 -> {len(pairs):,} pairs ({len(pairs) / len(frame):.1f}/S1); features")
+            feats = pc.build_features(idx, frame, pairs)
+            s1_ids = frame["entity_id"].to_numpy()[feats["s1_idx"].to_numpy()]
+            cand_ids = pool_ids[feats["t_idx"].to_numpy()]
+            feats["cand_key"] = feats["t_idx"].to_numpy().astype(np.int64) + offset
+            gt_set = {k: set(gt[k]) for k in set(s1_ids)}
+            feats["label"] = np.fromiter((t in gt_set[s] for s, t in zip(s1_ids, cand_ids)), dtype=np.int8, count=len(s1_ids))
+            feats["_s1"] = s1_ids
+            feats["_cand"] = cand_ids
+            feats["_country"] = c
+            parts.append(feats)
+        offset += len(pool) + 1
+        del idx, pool
+        gc.collect()
+
+    train = pd.concat(train_parts, ignore_index=True)
+    train["s1_key"] = train["_s1"].map(tr_key).astype(np.int64)
+    n_true = np.array([len(gt[k]) for k in tr_n["entity_id"]])
+    log(f"current: {len(train):,} training pairs ({int(train['label'].sum()):,} positive); training")
+    meta = ["_s1", "_cand", "_country"]
+    model, oof = pc.train_model(train.drop(columns=meta), n_true, len(tr_n),
+                                t_tops=kw.get("t_tops", (0.0,)), rels=kw.get("rels", (0.0,)))
+    cv_info = {"threshold": model.decision, "cv_macro_f05": model.cv["oof_macro_f05"], **model.cv}
+
+    cands, preds = defaultdict(list), defaultdict(list)
+    for feats in eval_parts:
+        prob = model.predict(feats)
+        s_key = pd.factorize(feats["_s1"])[0]
+        own = pc.one_owner(s_key, feats["cand_key"].to_numpy(), prob)
+        keep = pc.decide(s_key, prob, own, **model.decision)
+        for s, t in zip(feats["_s1"], feats["_cand"]):
+            cands[s].append(t)
+        for s, t in zip(feats["_s1"].to_numpy()[keep], feats["_cand"].to_numpy()[keep]):
+            preds[s].append(t)
+    return dict(cands), dict(preds), cv_info
+
+
+ADAPTERS = {"original": adapter_original, "antigravity": adapter_antigravity, "current": adapter_current}
 
 
 # -----------------------------------------------------------------------------
@@ -360,7 +424,12 @@ def main():
     ap.add_argument("--train-countries", nargs="*")
     ap.add_argument("--eval-countries", nargs="*")
     ap.add_argument("--no-results-md", action="store_true", help="smoke tests: do not append to RESULTS.md")
+    ap.add_argument("--smoke-pool-frac", type=float, default=None,
+                    help="CODE-PATH TESTS ONLY: shrink S2/S3 pools to true matches of the sampled S1 + this "
+                         "fraction of the rest. Scores are meaningless; implies --no-results-md.")
     args = ap.parse_args()
+    if args.smoke_pool_frac is not None:
+        args.no_results_md = True
 
     sys.path.insert(0, PROJECT_ROOT)
     from src.metrics import evaluate_macro_f05  # verified metric, shared by all versions
@@ -371,7 +440,13 @@ def main():
     tr, ev = make_split(s1, args.n_train, args.n_eval, args.train_countries, args.eval_countries)
     log(f"train S1 {len(tr):,} {tr['country'].value_counts().to_dict()} | eval S1 {len(ev):,} {ev['country'].value_counts().to_dict()}")
     del s1
-    mods = load_modules(args.code_dir)
+    if args.smoke_pool_frac is not None:
+        keep = set(chain.from_iterable(gt[k] for k in chain(tr["entity_id"], ev["entity_id"])))
+        shrink = lambda d: d[d["entity_id"].isin(keep) | (np.random.default_rng(0).random(len(d)) < args.smoke_pool_frac)]
+        s2, s3 = shrink(s2).reset_index(drop=True), shrink(s3).reset_index(drop=True)
+        log(f"SMOKE: pools shrunk to S2 {len(s2):,} / S3 {len(s3):,} (scores not meaningful)")
+    mods = load_modules(args.code_dir, ("pipeline_core",) if args.adapter == "current" else
+                        ("normalization", "blocking", "features", "model", "postprocessing"))
 
     cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)
     minutes = (time.time() - T0) / 60

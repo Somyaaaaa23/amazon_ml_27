@@ -1,242 +1,186 @@
 """
-Stage 3: Pair Feature Engineering module.
-Implements:
-- P0-3: Fast vectorized feature extraction and group rank/gap transformations.
-- P1-5: cand_cosine_sim feature from blocker.
-- P1-6: Unseen rare-word IDF mass defaulted to max_idf.
-- P2-3, P2-4, P2-5: House number matching, address missingness handling (np.nan), and comma-component overlap.
+Stage 3: vectorized pair features.
+
+Pairs are given as index arrays (s1_idx, t_idx) into a normalized S1 frame and a normalized
+target-pool frame of ONE country. String similarities use rapidfuzz.process.cpdist (C++,
+multi-threaded); token / IDF / address-component overlaps use sparse binary matrices, so no
+Python loop runs per pair. A similarity is NaN when either side is empty (LightGBM treats NaN
+as missing), instead of a misleading 0 or 1.
 """
 
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List
+
 import numpy as np
 import pandas as pd
-from rapidfuzz import fuzz
-from rapidfuzz.distance import Levenshtein, JaroWinkler, LCSseq
+import scipy.sparse as sp
+from rapidfuzz import fuzz, process
+from rapidfuzz.distance import JaroWinkler, LCSseq, Levenshtein
+from sklearn.feature_extraction.text import CountVectorizer
+
+TOKEN_PATTERN = r"(?u)\b\w+\b"
 
 
-FEATURE_COLS = [
-    "cand_cosine_sim",
-    "name_jw",
-    "name_core_jw",
-    "name_lev",
-    "name_token_set",
-    "name_token_sort",
-    "name_partial",
-    "name_core_exact",
-    "name_lcs_ratio",
-    "addr_jw",
-    "addr_lev",
-    "addr_token_set",
-    "addr_token_sort",
-    "addr_lcs_ratio",
-    "addr_comp_overlap",
-    "hn_match",
-    "addr_missing",
-    "sum_shared_idf",
-    "max_shared_idf",
-    "idf_coverage_ratio",
-    "name_len_ratio",
-    "addr_len_ratio",
-    "token_cnt_diff_name",
-    "name_addr_geometric_mean",
-    "name_addr_min",
-    "is_source_2",
-    "cand_rank",
-    "cand_pool_size",
-    "cand_score_gap"
-]
+def _components(addr: str) -> List[str]:
+    return [c.strip() for c in addr.split(",") if c.strip()]
 
 
-def component_overlap(addr1: str, addr2: str) -> float:
-    """
-    Computes order-independent fuzzy overlap of comma-separated address components (P2-3).
-    """
-    if not addr1 or not addr2:
-        return np.nan
-    comps1 = [c.strip() for c in addr1.split(",") if c.strip()]
-    comps2 = [c.strip() for c in addr2.split(",") if c.strip()]
-    if not comps1 or not comps2:
-        return 0.0
+class TokenSpace:
+    """Binary token matrices + IDF for one country, fitted on that country's own text (pool + S1),
+    so an unseen country (France) gets its own statistics."""
 
-    matches = 0
-    for c1 in comps1:
-        best_sim = max((Levenshtein.normalized_similarity(c1, c2) for c2 in comps2), default=0.0)
-        if best_sim >= 0.85:
-            matches += 1
+    def __init__(self):
+        self.name_vec = CountVectorizer(token_pattern=TOKEN_PATTERN, binary=True, lowercase=False, dtype=np.float32)
+        self.addr_vec = CountVectorizer(token_pattern=TOKEN_PATTERN, binary=True, lowercase=False, dtype=np.float32)
+        self.comp_vec = CountVectorizer(analyzer=_components, binary=True, lowercase=False, dtype=np.float32)
+        self.num_vec = CountVectorizer(token_pattern=r"\b\d+[a-z]?\b", binary=True, lowercase=False, dtype=np.float32)
 
-    return matches / max(len(comps1), 1)
+    def fit(self, *frames: pd.DataFrame) -> "TokenSpace":
+        names = pd.concat([f["name_norm"] for f in frames])
+        addrs = pd.concat([f["addr_norm"] for f in frames])
+        n_docs = len(names)
+        self.name_idf = self._idf(self.name_vec.fit_transform(names), n_docs)
+        self.addr_idf = self._idf(self.addr_vec.fit_transform(addrs), n_docs)
+        self.comp_vec.fit(addrs)
+        self.num_vec.fit(addrs)
+        return self
 
+    @staticmethod
+    def _idf(X, n_docs):
+        df = np.asarray(X.sum(axis=0)).ravel()
+        return np.log((1.0 + n_docs) / (1.0 + df)).astype(np.float32) + 1.0
 
-class PairFeatureExtractor:
-    def __init__(self, idf_dict: Dict[str, float] = None, max_idf: float = 10.0):
-        self.idf_dict = idf_dict or {}
-        self.max_idf = max_idf
-
-    def extract_pair_features(
-        self,
-        r1: Dict[str, Any],
-        r2: Dict[str, Any],
-        cosine_sim: float = 0.0
-    ) -> Dict[str, float]:
-        s1_name_norm = str(r1.get("name_norm", ""))
-        s2_name_norm = str(r2.get("name_norm", ""))
-        s1_name_core = str(r1.get("name_core", ""))
-        s2_name_core = str(r2.get("name_core", ""))
-
-        s1_addr_norm = str(r1.get("addr_norm", ""))
-        s2_addr_norm = str(r2.get("addr_norm", ""))
-        s1_hn = str(r1.get("house_number", "")).strip()
-        s2_hn = str(r2.get("house_number", "")).strip()
-        s2_addr_missing = float(r2.get("addr_missing", 0.0))
-
-        target_id = str(r2.get("entity_id", ""))
-
-        # 1. Name Similarities
-        name_jw = JaroWinkler.similarity(s1_name_norm, s2_name_norm)
-        name_core_jw = JaroWinkler.similarity(s1_name_core, s2_name_core)
-        name_lev = Levenshtein.normalized_similarity(s1_name_norm, s2_name_norm)
-        name_token_set = fuzz.token_set_ratio(s1_name_norm, s2_name_norm) / 100.0
-        name_token_sort = fuzz.token_sort_ratio(s1_name_norm, s2_name_norm) / 100.0
-        name_partial = fuzz.partial_ratio(s1_name_norm, s2_name_norm) / 100.0
-        name_core_exact = 1.0 if s1_name_core and s1_name_core == s2_name_core else 0.0
-        name_lcs_ratio = LCSseq.normalized_similarity(s1_name_norm, s2_name_norm)
-
-        # 2. Address Similarities (P2-4: native NaN for missing address)
-        if s2_addr_missing or not s2_addr_norm:
-            addr_jw = np.nan
-            addr_lev = np.nan
-            addr_token_set = np.nan
-            addr_token_sort = np.nan
-            addr_lcs_ratio = np.nan
-            addr_comp_overlap = np.nan
-            addr_len_ratio = np.nan
-            name_addr_geometric_mean = name_jw
-            name_addr_min = name_jw
-        else:
-            addr_jw = JaroWinkler.similarity(s1_addr_norm, s2_addr_norm)
-            addr_lev = Levenshtein.normalized_similarity(s1_addr_norm, s2_addr_norm)
-            addr_token_set = fuzz.token_set_ratio(s1_addr_norm, s2_addr_norm) / 100.0
-            addr_token_sort = fuzz.token_sort_ratio(s1_addr_norm, s2_addr_norm) / 100.0
-            addr_lcs_ratio = LCSseq.normalized_similarity(s1_addr_norm, s2_addr_norm)
-            addr_comp_overlap = component_overlap(s1_addr_norm, s2_addr_norm)
-            len_s1_a, len_s2_a = len(s1_addr_norm), len(s2_addr_norm)
-            addr_len_ratio = min(len_s1_a, len_s2_a) / max(len_s1_a, len_s2_a, 1)
-            name_addr_geometric_mean = np.sqrt(max(0.0, name_jw * addr_jw))
-            name_addr_min = min(name_jw, addr_jw)
-
-        # House Number Matching (P2-3)
-        if s1_hn and s2_hn:
-            hn_match = 1.0 if s1_hn == s2_hn else -1.0
-        else:
-            hn_match = 0.0
-
-        # 3. Rare Token / IDF Mass Evidence (P1-6: unseen tokens get max_idf)
-        s1_tokens = set(s1_name_norm.split())
-        s2_tokens = set(s2_name_norm.split())
-        shared_tokens = s1_tokens.intersection(s2_tokens)
-
-        shared_idfs = [self.idf_dict.get(tok, self.max_idf) for tok in shared_tokens]
-        s1_all_idfs = [self.idf_dict.get(tok, self.max_idf) for tok in s1_tokens]
-
-        sum_shared_idf = sum(shared_idfs)
-        max_shared_idf = max(shared_idfs) if shared_idfs else 0.0
-        total_s1_idf = sum(s1_all_idfs) if s1_all_idfs else 1.0
-        idf_coverage_ratio = sum_shared_idf / total_s1_idf
-
-        # 4. Structural Features
-        len_s1_n, len_s2_n = len(s1_name_norm), len(s2_name_norm)
-        name_len_ratio = min(len_s1_n, len_s2_n) / max(len_s1_n, len_s2_n, 1)
-        token_cnt_diff_name = float(abs(len(s1_tokens) - len(s2_tokens)))
-        is_source_2 = 1.0 if target_id.startswith("S2-") else 0.0
-
+    def transform(self, frame: pd.DataFrame) -> Dict[str, sp.csr_matrix]:
         return {
-            "cand_cosine_sim": float(cosine_sim),
-            "name_jw": name_jw,
-            "name_core_jw": name_core_jw,
-            "name_lev": name_lev,
-            "name_token_set": name_token_set,
-            "name_token_sort": name_token_sort,
-            "name_partial": name_partial,
-            "name_core_exact": name_core_exact,
-            "name_lcs_ratio": name_lcs_ratio,
-            "addr_jw": addr_jw,
-            "addr_lev": addr_lev,
-            "addr_token_set": addr_token_set,
-            "addr_token_sort": addr_token_sort,
-            "addr_lcs_ratio": addr_lcs_ratio,
-            "addr_comp_overlap": addr_comp_overlap,
-            "hn_match": hn_match,
-            "addr_missing": s2_addr_missing,
-            "sum_shared_idf": sum_shared_idf,
-            "max_shared_idf": max_shared_idf,
-            "idf_coverage_ratio": idf_coverage_ratio,
-            "name_len_ratio": name_len_ratio,
-            "addr_len_ratio": addr_len_ratio,
-            "token_cnt_diff_name": token_cnt_diff_name,
-            "name_addr_geometric_mean": name_addr_geometric_mean,
-            "name_addr_min": name_addr_min,
-            "is_source_2": is_source_2,
+            "name": self.name_vec.transform(frame["name_norm"]).tocsr(),
+            "addr": self.addr_vec.transform(frame["addr_norm"]).tocsr(),
+            "comp": self.comp_vec.transform(frame["addr_norm"]).tocsr(),
+            "num": self.num_vec.transform(frame["addr_norm"]).tocsr(),
         }
 
-    def build_feature_table(
-        self,
-        df_s1: pd.DataFrame,
-        df_target: pd.DataFrame,
-        candidates_dict: Dict[str, List[str]],
-        cosine_sims_dict: Optional[Dict[Tuple[str, str], float]] = None,
-        ground_truth_dict: Optional[Dict[str, List[str]]] = None
-    ) -> pd.DataFrame:
-        s1_map = df_s1.set_index("entity_id").to_dict(orient="index")
-        target_map = df_target.set_index("entity_id").to_dict(orient="index")
-        cos_map = cosine_sims_dict or {}
 
-        records = []
-        for s1_id, cand_ids in candidates_dict.items():
-            if s1_id not in s1_map or not cand_ids:
-                continue
+def _pairwise(scorer, a, b, scale=1.0):
+    out = process.cpdist(a, b, scorer=scorer, workers=-1, dtype=np.float32)
+    return out / scale if scale != 1.0 else out
 
-            r1 = s1_map[s1_id]
-            true_set = set(ground_truth_dict.get(s1_id, [])) if ground_truth_dict is not None else set()
 
-            for cand_id in cand_ids:
-                if cand_id not in target_map:
-                    continue
-                r2 = target_map[cand_id]
-                cos_val = cos_map.get((s1_id, cand_id), 0.0)
+def _weighted_overlap(A, B, idf):
+    """For binary row-aligned matrices A, B: IDF mass shared, IDF mass of A, of B, max shared IDF."""
+    inter = A.multiply(B).tocsr()
+    shared = inter @ idf
+    mass_a, mass_b = A @ idf, B @ idf
+    w = inter.multiply(idf[None, :]).tocsr()
+    max_shared = np.zeros(A.shape[0], dtype=np.float32)
+    nz = np.diff(w.indptr) > 0
+    if nz.any():
+        max_shared[nz] = np.maximum.reduceat(w.data, w.indptr[:-1][nz])
+    return shared.astype(np.float32), mass_a.astype(np.float32), mass_b.astype(np.float32), max_shared
 
-                feat = self.extract_pair_features(r1, r2, cosine_sim=cos_val)
-                feat["source1_entity_id"] = s1_id
-                feat["candidate_entity_id"] = cand_id
 
-                if ground_truth_dict is not None:
-                    feat["label"] = 1 if cand_id in true_set else 0
+def _safe_div(a, b):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(b > 0, a / b, np.nan).astype(np.float32)
 
-                records.append(feat)
 
-        if not records:
-            return pd.DataFrame()
+def pair_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_mats, t_mats, space: TokenSpace,
+                  s1_idx: np.ndarray, t_idx: np.ndarray) -> pd.DataFrame:
+    """Row-aligned features for pairs (s1_idx[i], t_idx[i]). Group/rank features are added separately."""
+    f = {}
+    col = lambda df, c, idx: df[c].to_numpy(dtype=object)[idx]
+    n1, n2 = col(s1, "name_norm", s1_idx), col(tgt, "name_norm", t_idx)
+    c1, c2 = col(s1, "name_core", s1_idx), col(tgt, "name_core", t_idx)
+    a1, a2 = col(s1, "addr_norm", s1_idx), col(tgt, "addr_norm", t_idx)
 
-        df_pairs = pd.DataFrame(records)
+    name_empty = (s1["name_norm"].str.len().to_numpy()[s1_idx] == 0) | (tgt["name_norm"].str.len().to_numpy()[t_idx] == 0)
+    core_empty = (s1["name_core"].str.len().to_numpy()[s1_idx] == 0) | (tgt["name_core"].str.len().to_numpy()[t_idx] == 0)
+    addr_empty = (s1["addr_norm"].str.len().to_numpy()[s1_idx] == 0) | (tgt["addr_norm"].str.len().to_numpy()[t_idx] == 0)
 
-        # Vectorized rank and gap features per S1 entity (P0-3)
-        # Composite sorting score combining cosine and JW
-        comp_score = df_pairs["cand_cosine_sim"] * 0.5 + df_pairs["name_jw"] * 0.5
-        df_pairs["_comp_score"] = comp_score
+    # 1. name strings
+    f["name_jw"] = _pairwise(JaroWinkler.normalized_similarity, n1, n2)
+    f["name_lev"] = _pairwise(Levenshtein.normalized_similarity, n1, n2)
+    f["name_lcs"] = _pairwise(LCSseq.normalized_similarity, n1, n2)
+    f["name_tset"] = _pairwise(fuzz.token_set_ratio, n1, n2, 100.0)
+    f["name_tsort"] = _pairwise(fuzz.token_sort_ratio, n1, n2, 100.0)
+    f["name_partial"] = _pairwise(fuzz.partial_ratio, n1, n2, 100.0)
+    for k in ["name_jw", "name_lev", "name_lcs", "name_tset", "name_tsort", "name_partial"]:
+        f[k][name_empty] = np.nan
+    f["core_jw"] = _pairwise(JaroWinkler.normalized_similarity, c1, c2)
+    f["core_tset"] = _pairwise(fuzz.token_set_ratio, c1, c2, 100.0)
+    f["core_jw"][core_empty] = np.nan
+    f["core_tset"][core_empty] = np.nan
+    f["core_exact"] = ((c1 == c2) & ~core_empty).astype(np.float32)
 
-        # Cand rank (1 = best score)
-        df_pairs["cand_rank"] = df_pairs.groupby("source1_entity_id")["_comp_score"].rank(ascending=False, method="first").astype(float)
-        df_pairs["cand_pool_size"] = df_pairs.groupby("source1_entity_id")["candidate_entity_id"].transform("count").astype(float)
+    # 2. address strings
+    f["addr_jw"] = _pairwise(JaroWinkler.normalized_similarity, a1, a2)
+    f["addr_lcs"] = _pairwise(LCSseq.normalized_similarity, a1, a2)
+    f["addr_tset"] = _pairwise(fuzz.token_set_ratio, a1, a2, 100.0)
+    f["addr_tsort"] = _pairwise(fuzz.token_sort_ratio, a1, a2, 100.0)
+    for k in ["addr_jw", "addr_lcs", "addr_tset", "addr_tsort"]:
+        f[k][addr_empty] = np.nan
+    f["addr_missing"] = (tgt["addr_norm"].str.len().to_numpy()[t_idx] == 0).astype(np.float32)
 
-        # Best and second-best scores per S1 group
-        best_scores = df_pairs.groupby("source1_entity_id")["_comp_score"].transform("max")
-        # Gap to best (for rank > 1) or gap to 2nd best (for rank 1)
-        gaps = np.zeros(len(df_pairs), dtype=float)
-        is_rank1 = (df_pairs["cand_rank"] == 1.0).values
+    # 3. house / street number: +1 same, -1 different, 0 when either side has none
+    h1, h2 = col(s1, "house_number", s1_idx), col(tgt, "house_number", t_idx)
+    has = (s1["house_number"].str.len().to_numpy()[s1_idx] > 0) & (tgt["house_number"].str.len().to_numpy()[t_idx] > 0)
+    f["hn_match"] = np.where(has, np.where(h1 == h2, 1.0, -1.0), 0.0).astype(np.float32)
 
-        diff_from_best = (best_scores - df_pairs["_comp_score"]).values
-        gaps[~is_rank1] = diff_from_best[~is_rank1]
-        gaps[is_rank1] = 0.5  # Positive baseline gap for rank 1
-        df_pairs["cand_score_gap"] = gaps
+    # 4. IDF-weighted token overlap (names, address words) and address-component overlap
+    A, B = s1_mats["name"][s1_idx], t_mats["name"][t_idx]
+    shared, m1, m2, mx = _weighted_overlap(A, B, space.name_idf)
+    f["name_idf_shared"] = shared
+    f["name_idf_max_shared"] = mx
+    f["name_idf_cov_s1"] = _safe_div(shared, m1)
+    f["name_idf_cov_t"] = _safe_div(shared, m2)
+    f["name_idf_miss_s1"] = (m1 - shared).astype(np.float32)
+    f["name_idf_miss_t"] = (m2 - shared).astype(np.float32)
 
-        df_pairs.drop(columns=["_comp_score"], inplace=True)
-        return df_pairs
+    A, B = s1_mats["addr"][s1_idx], t_mats["addr"][t_idx]
+    shared, m1, m2, mx = _weighted_overlap(A, B, space.addr_idf)
+    f["addr_idf_cov_s1"] = _safe_div(shared, m1)
+    f["addr_idf_cov_t"] = _safe_div(shared, m2)
+    f["addr_idf_max_shared"] = mx
+
+    A, B = s1_mats["comp"][s1_idx], t_mats["comp"][t_idx]
+    inter = np.asarray(A.multiply(B).sum(axis=1)).ravel()
+    f["comp_ov_s1"] = _safe_div(inter, np.asarray(A.sum(axis=1)).ravel())
+    f["comp_ov_t"] = _safe_div(inter, np.asarray(B.sum(axis=1)).ravel())
+    # all numbers in the two addresses (house, plot, unit, street numbers)
+    A, B = s1_mats["num"][s1_idx], t_mats["num"][t_idx]
+    inter = np.asarray(A.multiply(B).sum(axis=1)).ravel()
+    na, nb = np.asarray(A.sum(axis=1)).ravel(), np.asarray(B.sum(axis=1)).ravel()
+    f["num_jacc"] = _safe_div(inter, na + nb - inter)
+    f["num_conflict"] = ((na > 0) & (nb > 0) & (inter == 0)).astype(np.float32)
+    for k in ["addr_idf_cov_s1", "addr_idf_cov_t", "addr_idf_max_shared", "comp_ov_s1", "comp_ov_t", "num_jacc"]:
+        f[k][addr_empty] = np.nan
+
+    # 5. structure
+    l1, l2 = s1["name_norm"].str.len().to_numpy()[s1_idx], tgt["name_norm"].str.len().to_numpy()[t_idx]
+    f["name_len_ratio"] = _safe_div(np.minimum(l1, l2), np.maximum(l1, l2))
+    l1, l2 = s1["addr_norm"].str.len().to_numpy()[s1_idx], tgt["addr_norm"].str.len().to_numpy()[t_idx]
+    f["addr_len_ratio"] = _safe_div(np.minimum(l1, l2), np.maximum(l1, l2))
+    f["addr_len_ratio"][addr_empty] = np.nan
+    f["is_s2"] = np.char.startswith(tgt["entity_id"].to_numpy(dtype=str)[t_idx], "S2-").astype(np.float32)
+    return pd.DataFrame(f)
+
+
+def add_group_features(df: pd.DataFrame, key: str = "s1_idx",
+                       score_cols=("cos_comb", "name_tset", "addr_tset")) -> pd.DataFrame:
+    """Context of a pair among all candidates of the same S1 entity: rank, gap to best / second best."""
+    keys = df[key].to_numpy()
+    df["n_cands"] = df.groupby(key, sort=False)[key].transform("size").astype(np.float32)
+    for c in score_cols:
+        if c not in df:
+            continue
+        v = df[c].fillna(-1.0).to_numpy(dtype=np.float64)
+        order = np.lexsort((-v, keys))                      # by key, then score descending
+        sk, sv = keys[order], v[order]
+        starts = np.r_[0, np.flatnonzero(sk[1:] != sk[:-1]) + 1]
+        sizes = np.diff(np.r_[starts, len(sk)])
+        best_g = sv[starts]
+        second_g = np.where(sizes > 1, sv[np.minimum(starts + 1, len(sv) - 1)], -1.0)
+        best, second = np.empty_like(v), np.empty_like(v)
+        best[order] = np.repeat(best_g, sizes)
+        second[order] = np.repeat(second_g, sizes)
+        df[f"{c}_rank"] = pd.Series(v).groupby(keys).rank(ascending=False, method="min").to_numpy(dtype=np.float32)
+        df[f"{c}_gap_best"] = (best - v).astype(np.float32)
+        df[f"{c}_gap_second"] = np.where(v >= best, v - second, v - best).astype(np.float32)
+    return df
