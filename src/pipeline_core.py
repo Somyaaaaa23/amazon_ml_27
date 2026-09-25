@@ -66,14 +66,33 @@ class View:
     k: int                # top-k candidates taken from this view
 
 
+# Chosen with experiments/blocking_lab.py on the TRAINING side (India, 3k S1 vs the full 4.1M pool):
+# word TF-IDF on name+address, max_df=0.01: recall@30 91.0%, @50 92.3%, 2.6 ms/S1 (char 3-4 grams:
+# 87.7% @30 at 19.2 ms/S1). The name-only view adds candidates whose address differs.
 DEFAULT_VIEWS = [
-    View("comb", "combined", "char_wb", (3, 4), 0.01, 30),
-    View("name", "name_norm", "char_wb", (3, 3), 0.01, 20),
-    View("addr", "addr_norm", "char_wb", (3, 3), 0.01, 20),
+    View("comb", "combined", "word", (1, 1), 0.01, 40),
+    View("name", "name_norm", "word", (1, 1), 0.01, 15),
 ]
 
 
 _QFN = None
+_TVEC = None
+
+
+def _transform_chunk(texts):
+    return _TVEC.transform(texts)
+
+
+def parallel_transform(vec, texts: pd.Series, workers: int = 6, chunk: int = 200_000) -> sp.csr_matrix:
+    global _TVEC
+    parts = [texts.iloc[i:i + chunk] for i in range(0, len(texts), chunk)]
+    if len(parts) < 2:
+        return vec.transform(texts).tocsr()
+    _TVEC = vec
+    with mp.get_context("fork").Pool(workers) as pool:
+        mats = pool.map(_transform_chunk, parts)
+    _TVEC = None
+    return sp.vstack(mats).tocsr()
 
 
 def _qrun(args):
@@ -81,39 +100,61 @@ def _qrun(args):
 
 
 class CountryIndex:
-    def __init__(self, pool: pd.DataFrame, extra: Sequence[pd.DataFrame] = (), views: List[View] = None):
+    def __init__(self, pool: pd.DataFrame, extra: Sequence[pd.DataFrame] = (), views: List[View] = None,
+                 fit_sample: int = 1_000_000):
         """pool: normalized S2+S3 records of one country. extra: normalized S1 frames of the same
         country, used only as unlabeled text for fitting IDF statistics."""
         self.pool = pool.reset_index(drop=True)
         self.views = views or DEFAULT_VIEWS
-        self.vecs, self.T = {}, {}
+        self.vecs, self.TT = {}, {}
         for v in self.views:
+            extra_kw = {"token_pattern": r"(?u)\b\w+\b"} if v.analyzer == "word" else {}
             vec = TfidfVectorizer(analyzer=v.analyzer, ngram_range=v.ngram, min_df=2, max_df=v.max_df,
-                                  sublinear_tf=True, dtype=np.float32, token_pattern=r"(?u)\b\w+\b")
-            vec.fit(pd.concat([self.pool[v.field]] + [e[v.field] for e in extra]))
+                                  sublinear_tf=True, dtype=np.float32, **extra_kw)
+            corpus = pd.concat([self.pool[v.field]] + [e[v.field] for e in extra], ignore_index=True)
+            if len(corpus) > fit_sample:  # vocabulary + IDF from a fixed random sample (speed)
+                corpus = corpus.sample(fit_sample, random_state=0)
+            vec.fit(corpus)
             self.vecs[v.name] = vec
-            self.T[v.name] = vec.transform(self.pool[v.field]).tocsr()          # rows = targets
-        self.TT = {n: m.T.tocsr() for n, m in self.T.items()}                  # for Q @ TT
+            self.TT[v.name] = parallel_transform(vec, self.pool[v.field]).T.tocsr()  # features x targets, stored once
         self.space = TokenSpace().fit(self.pool, *extra)
         self.t_mats = self.space.transform(self.pool)
-        self.is_s2 = self.pool["entity_id"].str.startswith("S2-").to_numpy()
 
     def _query_batch(self, Q: Dict[str, sp.csr_matrix], lo: int, hi: int):
-        s_list, t_list = [], []
+        """Top-k of every view, unioned per S1; the cosine of every view for every union member is
+        read from that view's product row (0 when the two records share no kept n-gram)."""
+        prods = []
         for v in self.views:
             S = (Q[v.name][lo:hi] @ self.TT[v.name]).tocsr()
-            for r in range(S.shape[0]):
+            S.sort_indices()
+            prods.append(S)
+        s_out, t_out, cos_out = [], [], [[] for _ in self.views]
+        for r in range(hi - lo):
+            picks = []
+            for v, S in zip(self.views, prods):
                 a, b = S.indptr[r], S.indptr[r + 1]
-                if a == b:
-                    continue
-                d, ix = S.data[a:b], S.indices[a:b]
-                if len(d) > v.k:
-                    ix = ix[np.argpartition(-d, v.k)[:v.k]]
-                s_list.append(np.full(len(ix), lo + r, dtype=np.int32))
-                t_list.append(ix.astype(np.int32))
-        if not s_list:
-            return np.empty(0, np.int32), np.empty(0, np.int32)
-        return np.concatenate(s_list), np.concatenate(t_list)
+                if b - a > v.k:
+                    d = S.data[a:b]
+                    picks.append(S.indices[a:b][np.argpartition(-d, v.k)[:v.k]])
+                else:
+                    picks.append(S.indices[a:b])
+            u = np.unique(np.concatenate(picks))
+            if len(u) == 0:
+                continue
+            s_out.append(np.full(len(u), lo + r, dtype=np.int32))
+            t_out.append(u.astype(np.int32))
+            for j, S in enumerate(prods):
+                a, b = S.indptr[r], S.indptr[r + 1]
+                ix = S.indices[a:b]
+                pos = np.searchsorted(ix, u)
+                pos_c = np.minimum(pos, max(len(ix) - 1, 0))
+                hit = (pos < len(ix)) & (ix[pos_c] == u) if len(ix) else np.zeros(len(u), bool)
+                c = np.zeros(len(u), dtype=np.float32)
+                c[hit] = S.data[a:b][pos_c[hit]]
+                cos_out[j].append(c)
+        if not s_out:
+            return np.empty(0, np.int32), np.empty(0, np.int32), [np.empty(0, np.float32) for _ in self.views]
+        return np.concatenate(s_out), np.concatenate(t_out), [np.concatenate(c) for c in cos_out]
 
     def candidates(self, s1: pd.DataFrame, batch: int = 200, workers: int = 4) -> pd.DataFrame:
         """Union of the top-k of every view; returns pairs with the cosine of every view."""
@@ -127,17 +168,10 @@ class CountryIndex:
         else:
             res = [_qrun(sp_) for sp_ in spans]
         _QFN = None
-        s_idx = np.concatenate([r[0] for r in res]) if res else np.empty(0, np.int32)
-        t_idx = np.concatenate([r[1] for r in res]) if res else np.empty(0, np.int32)
-        key = np.unique(s_idx.astype(np.int64) * (len(self.pool) + 1) + t_idx)
-        s_idx, t_idx = (key // (len(self.pool) + 1)).astype(np.int32), (key % (len(self.pool) + 1)).astype(np.int32)
-        pairs = pd.DataFrame({"s1_idx": s_idx, "t_idx": t_idx})
-        for v in self.views:  # cosine of every view for every candidate (vectors are L2-normalized)
-            cos = np.empty(len(pairs), dtype=np.float32)
-            for lo in range(0, len(pairs), 500_000):
-                a, b = s_idx[lo:lo + 500_000], t_idx[lo:lo + 500_000]
-                cos[lo:lo + len(a)] = np.asarray(Q[v.name][a].multiply(self.T[v.name][b]).sum(axis=1)).ravel()
-            pairs[f"cos_{v.name}"] = cos
+        pairs = pd.DataFrame({"s1_idx": np.concatenate([r[0] for r in res]),
+                              "t_idx": np.concatenate([r[1] for r in res])})
+        for j, v in enumerate(self.views):
+            pairs[f"cos_{v.name}"] = np.concatenate([r[2][j] for r in res])
         return pairs
 
 
@@ -157,7 +191,7 @@ def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, c
     cos_cols = [c for c in pairs.columns if c.startswith("cos_")]
     feats["cos_max"] = feats[cos_cols].max(axis=1)
     feats["cos_mean"] = feats[cos_cols].mean(axis=1)
-    return add_group_features(feats, "s1_idx", score_cols=("cos_comb", "cos_name", "cos_addr", "name_tset", "addr_tset"))
+    return add_group_features(feats, "s1_idx", score_cols=("cos_comb", "cos_name", "name_tset", "addr_tset"))
 
 
 def feature_columns(df: pd.DataFrame) -> List[str]:
@@ -184,8 +218,12 @@ class TrainedModel:
         return self.booster.predict_proba(feats[self.features].to_numpy(np.float32))[:, 1]
 
 
+DECISION_GRID = dict(ts=np.round(np.arange(0.20, 0.91, 0.04), 2),
+                     t_tops=(0.0, 0.5, 0.6, 0.7, 0.8, 0.9), rels=(0.0, 0.3, 0.5, 0.7))
+
+
 def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: int = 5,
-                t_tops=(0.0,), rels=(0.0,)):
+                t_tops=DECISION_GRID["t_tops"], rels=DECISION_GRID["rels"]):
     """feats: training pairs with 'label', 's1_key' (0..n_s1-1, unique over countries) and 'cand_key'
     (unique target id). n_true[s1_key] = number of true matches (including ones blocking missed).
     Returns (TrainedModel, oof probabilities)."""
@@ -197,12 +235,12 @@ def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: in
     best_iters = []
     for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_splits).split(X, y, groups)):
         m = lgb.LGBMClassifier(**LGB_PARAMS)
-        m.fit(X[tr], y[tr], eval_set=[(X[va], y[va])], callbacks=[lgb.early_stopping(100, verbose=False)])
+        m.fit(X[tr], y[tr], eval_X=(X[va],), eval_y=(y[va],), callbacks=[lgb.early_stopping(100, verbose=False)])
         oof[va] = m.predict_proba(X[va])[:, 1]
         best_iters.append(m.best_iteration_)
         log(f"  fold {fold + 1}/{n_splits}: best_iter={m.best_iteration_}")
     params, best, _ = tune(groups, feats["cand_key"].to_numpy(), oof, y.astype(bool), n_true, n_s1,
-                           t_tops=t_tops, rels=rels)
+                           ts=DECISION_GRID["ts"], t_tops=t_tops, rels=rels)
     n_est = int(np.mean(best_iters) * 1.1)
     final = lgb.LGBMClassifier(**{**LGB_PARAMS, "n_estimators": n_est})
     final.fit(X, y)

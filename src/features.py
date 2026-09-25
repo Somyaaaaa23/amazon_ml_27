@@ -15,7 +15,7 @@ import pandas as pd
 import scipy.sparse as sp
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler, LCSseq, Levenshtein
-from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import HashingVectorizer
 
 TOKEN_PATTERN = r"(?u)\b\w+\b"
 
@@ -25,37 +25,31 @@ def _components(addr: str) -> List[str]:
 
 
 class TokenSpace:
-    """Binary token matrices + IDF for one country, fitted on that country's own text (pool + S1),
-    so an unseen country (France) gets its own statistics."""
+    """Binary hashed token matrices + IDF for one country, with document frequencies counted on that
+    country's own text (pool + S1), so an unseen country (France) gets its own statistics.
+    Hashing (2^22 buckets) needs no vocabulary pass, so transforms run in parallel."""
 
-    def __init__(self):
-        self.name_vec = CountVectorizer(token_pattern=TOKEN_PATTERN, binary=True, lowercase=False, dtype=np.float32)
-        self.addr_vec = CountVectorizer(token_pattern=TOKEN_PATTERN, binary=True, lowercase=False, dtype=np.float32)
-        self.comp_vec = CountVectorizer(analyzer=_components, binary=True, lowercase=False, dtype=np.float32)
-        self.num_vec = CountVectorizer(token_pattern=r"\b\d+[a-z]?\b", binary=True, lowercase=False, dtype=np.float32)
+    FIELDS = {"name": ("name_norm", TOKEN_PATTERN), "addr": ("addr_norm", TOKEN_PATTERN),
+              "comp": ("addr_norm", None), "num": ("addr_norm", r"\b\d+[a-z]?\b")}
+
+    def __init__(self, n_features: int = 2 ** 22):
+        self.vecs = {}
+        for k, (_, pat) in self.FIELDS.items():
+            kw = {"analyzer": _components} if pat is None else {"token_pattern": pat}
+            self.vecs[k] = HashingVectorizer(n_features=n_features, binary=True, norm=None, alternate_sign=False,
+                                             lowercase=False, dtype=np.float32, **kw)
 
     def fit(self, *frames: pd.DataFrame) -> "TokenSpace":
-        names = pd.concat([f["name_norm"] for f in frames])
-        addrs = pd.concat([f["addr_norm"] for f in frames])
-        n_docs = len(names)
-        self.name_idf = self._idf(self.name_vec.fit_transform(names), n_docs)
-        self.addr_idf = self._idf(self.addr_vec.fit_transform(addrs), n_docs)
-        self.comp_vec.fit(addrs)
-        self.num_vec.fit(addrs)
+        from src.pipeline_core import parallel_transform
+        n_docs = sum(len(f) for f in frames)
+        for k, field in [("name", "name_norm"), ("addr", "addr_norm")]:
+            df = sum(np.asarray(parallel_transform(self.vecs[k], f[field]).sum(axis=0)).ravel() for f in frames)
+            setattr(self, f"{k}_idf", (np.log((1.0 + n_docs) / (1.0 + df)) + 1.0).astype(np.float32))
         return self
 
-    @staticmethod
-    def _idf(X, n_docs):
-        df = np.asarray(X.sum(axis=0)).ravel()
-        return np.log((1.0 + n_docs) / (1.0 + df)).astype(np.float32) + 1.0
-
     def transform(self, frame: pd.DataFrame) -> Dict[str, sp.csr_matrix]:
-        return {
-            "name": self.name_vec.transform(frame["name_norm"]).tocsr(),
-            "addr": self.addr_vec.transform(frame["addr_norm"]).tocsr(),
-            "comp": self.comp_vec.transform(frame["addr_norm"]).tocsr(),
-            "num": self.num_vec.transform(frame["addr_norm"]).tocsr(),
-        }
+        from src.pipeline_core import parallel_transform
+        return {k: parallel_transform(self.vecs[k], frame[field]) for k, (field, _) in self.FIELDS.items()}
 
 
 def _pairwise(scorer, a, b, scale=1.0):

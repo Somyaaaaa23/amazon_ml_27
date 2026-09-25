@@ -372,8 +372,7 @@ def adapter_current(mods, s1, s2, s3, gt, tr, ev, **kw):
     n_true = np.array([len(gt[k]) for k in tr_n["entity_id"]])
     log(f"current: {len(train):,} training pairs ({int(train['label'].sum()):,} positive); training")
     meta = ["_s1", "_cand", "_country"]
-    model, oof = pc.train_model(train.drop(columns=meta), n_true, len(tr_n),
-                                t_tops=kw.get("t_tops", (0.0,)), rels=kw.get("rels", (0.0,)))
+    model, oof = pc.train_model(train.drop(columns=meta), n_true, len(tr_n))
     cv_info = {"threshold": model.decision, "cv_macro_f05": model.cv["oof_macro_f05"], **model.cv}
 
     cands, preds = defaultdict(list), defaultdict(list)
