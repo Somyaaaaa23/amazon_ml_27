@@ -1,0 +1,14 @@
+# data (large, not ours to redistribute)
+student_resource/dataset/
+dataset_sample_50k/
+# generated outputs / caches
+output/
+output_50k/
+output_val/
+cache/
+*.pkl
+*.npz
+# system
+.DS_Store
+__pycache__/
+*.pyc
