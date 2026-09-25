@@ -23,41 +23,7 @@ from sklearn.model_selection import GroupKFold
 from sklearn.isotonic import IsotonicRegression
 from src.metrics import evaluate_macro_f05
 from src.postprocessing import generate_matching_predictions
-
-
-FEATURE_COLS = [
-    "name_jw",
-    "name_core_jw",
-    "name_lev",
-    "name_token_set",
-    "name_token_sort",
-    "name_partial",
-    "name_core_exact",
-    "name_word_jaccard",
-    "name_char_jaccard",
-    "name_lcs_ratio",
-    "addr_jw",
-    "addr_lev",
-    "addr_token_set",
-    "addr_token_sort",
-    "addr_word_jaccard",
-    "addr_char_jaccard",
-    "postal_match",
-    "postal_missing",
-    "sum_shared_idf",
-    "max_shared_idf",
-    "idf_coverage_ratio",
-    "name_len_ratio",
-    "addr_len_ratio",
-    "token_cnt_diff_name",
-    "token_cnt_diff_addr",
-    "name_addr_geometric_mean",
-    "name_addr_min",
-    "is_source_2",
-    "cand_rank",
-    "cand_pool_size",
-    "cand_score_gap"
-]
+from src.features import FEATURE_COLS
 
 
 class EntityMatcherModel:
@@ -71,6 +37,7 @@ class EntityMatcherModel:
             "num_leaves": 31,
             "min_child_samples": 5,
             "subsample": 0.8,
+            "subsample_freq": 1,
             "colsample_bytree": 0.8,
             "random_state": 42,
             "verbose": -1,
