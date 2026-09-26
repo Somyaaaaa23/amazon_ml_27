@@ -102,7 +102,7 @@ def _qrun(args):
 
 class CountryIndex:
     def __init__(self, pool: pd.DataFrame, extra: Sequence[pd.DataFrame] = (), views: List[View] = None,
-                 fit_sample: int = 1_000_000):
+                 fit_sample: Optional[int] = None, expand: bool = True):
         """pool: normalized S2+S3 records of one country. extra: normalized S1 frames of the same
         country, used only as unlabeled text for fitting IDF statistics."""
         self.pool = pool.reset_index(drop=True)
@@ -113,13 +113,19 @@ class CountryIndex:
             vec = TfidfVectorizer(analyzer=v.analyzer, ngram_range=v.ngram, min_df=2, max_df=v.max_df,
                                   sublinear_tf=True, dtype=np.float32, **extra_kw)
             corpus = pd.concat([self.pool[v.field]] + [e[v.field] for e in extra], ignore_index=True)
-            if len(corpus) > fit_sample:  # vocabulary + IDF from a fixed random sample (speed)
+            if fit_sample and len(corpus) > fit_sample:  # optional: vocabulary + IDF from a random sample
                 corpus = corpus.sample(fit_sample, random_state=0)
             vec.fit(corpus)
             self.vecs[v.name] = vec
             self.TT[v.name] = parallel_transform(vec, self.pool[v.field]).T.tocsr()  # features x targets, stored once
+        self.T = {n: m.T.tocsr() for n, m in self.TT.items()}   # targets x features (word views are small)
         self.space = TokenSpace().fit(self.pool, *extra)
         self.t_mats = self.space.transform(self.pool)
+        # exact-twin groups for sibling expansion (records of one business often share the exact
+        # normalized address or compact name); large groups are generic and skipped
+        self.expand = expand
+        self.addr_groups = _twin_groups(self.pool["addr_norm"], min_len=8)
+        self.compact_groups = _twin_groups(self.pool["name_compact"], min_len=6)
 
     def _query_batch(self, Q: Dict[str, sp.csr_matrix], lo: int, hi: int):
         """Top-k of every view, unioned per S1; the cosine of every view for every union member is
@@ -173,7 +179,82 @@ class CountryIndex:
                               "t_idx": np.concatenate([r[1] for r in res])})
         for j, v in enumerate(self.views):
             pairs[f"cos_{v.name}"] = np.concatenate([r[2][j] for r in res])
+        pairs["expanded"] = np.float32(0)
+        if self.expand and len(pairs):
+            pairs = self._expand(s1, Q, pairs)
         return pairs
+
+    def _cos(self, Q, s_idx, t_idx):
+        out = {}
+        for v in self.views:
+            c = np.empty(len(s_idx), dtype=np.float32)
+            for lo in range(0, len(s_idx), 500_000):
+                a, b = s_idx[lo:lo + 500_000], t_idx[lo:lo + 500_000]
+                c[lo:lo + len(a)] = np.asarray(Q[v.name][a].multiply(self.T[v.name][b]).sum(axis=1)).ravel()
+            out[f"cos_{v.name}"] = c
+        return out
+
+    def _expand(self, s1: pd.DataFrame, Q, pairs: pd.DataFrame, max_new: int = 20) -> pd.DataFrame:
+        """Add exact twins (same normalized address or same compact name) of 'anchor' candidates,
+        i.e. candidates whose name and address both closely match the S1 record."""
+        s_idx, t_idx = pairs["s1_idx"].to_numpy(), pairs["t_idx"].to_numpy()
+        n1 = s1["name_norm"].to_numpy(dtype=object)[s_idx]
+        n2 = self.pool["name_norm"].to_numpy(dtype=object)[t_idx]
+        a1 = s1["addr_norm"].to_numpy(dtype=object)[s_idx]
+        a2 = self.pool["addr_norm"].to_numpy(dtype=object)[t_idx]
+        name_ts = process.cpdist(n1, n2, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
+        addr_ts = process.cpdist(a1, a2, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
+        anchor = (name_ts >= 90) & (addr_ts >= 80)
+        sa, ta = s_idx[anchor], t_idx[anchor]
+        new_s, new_t = [], []
+        for codes, (order, ptr) in [(self.addr_groups[0], self.addr_groups[1:]), (self.compact_groups[0], self.compact_groups[1:])]:
+            c = codes[ta]
+            ok = c >= 0
+            if not ok.any():
+                continue
+            c, ss = c[ok], sa[ok]
+            lens = ptr[c + 1] - ptr[c]
+            rep_s = np.repeat(ss, lens)
+            offs = np.repeat(ptr[c], lens) + (np.arange(lens.sum()) - np.repeat(np.cumsum(lens) - lens, lens))
+            new_s.append(rep_s)
+            new_t.append(order[offs])
+        if not new_s:
+            return pairs
+        N = len(self.pool) + 1
+        key_new = np.unique(np.concatenate(new_s).astype(np.int64) * N + np.concatenate(new_t))
+        key_old = s_idx.astype(np.int64) * N + t_idx
+        key_new = key_new[~np.isin(key_new, key_old)]
+        ns, nt = (key_new // N).astype(np.int32), (key_new % N).astype(np.int32)
+        # cap additions per S1 (keys are sorted by S1, so keep the first max_new of each)
+        first = np.r_[0, np.flatnonzero(ns[1:] != ns[:-1]) + 1]
+        rank = np.arange(len(ns)) - np.repeat(first, np.diff(np.r_[first, len(ns)]))
+        keep = rank < max_new
+        ns, nt = ns[keep], nt[keep]
+        add = pd.DataFrame({"s1_idx": ns, "t_idx": nt, **self._cos(Q, ns, nt)})
+        add["expanded"] = np.float32(1)
+        return pd.concat([pairs, add], ignore_index=True)
+
+
+def _twin_groups(values: pd.Series, min_len: int, max_size: int = 20):
+    """codes[i] = group id of record i (-1 if its value is short, unique or in a group > max_size);
+    (order, ptr) list the members of each group: order[ptr[g]:ptr[g+1]]."""
+    codes, _ = pd.factorize(values.where(values.str.len() >= min_len))   # missing -> -1
+    if (codes >= 0).any():
+        sizes = np.bincount(codes[codes >= 0])
+        good = (sizes >= 2) & (sizes <= max_size)
+        codes = np.where((codes >= 0) & good[np.maximum(codes, 0)], codes, -1)
+    return _compact_codes(codes)
+
+
+def _compact_codes(codes):
+    keep = codes >= 0
+    uniq, inv = np.unique(codes[keep], return_inverse=True)
+    out = np.full(len(codes), -1, dtype=np.int64)
+    out[keep] = inv
+    idx = np.flatnonzero(keep)
+    order = idx[np.argsort(inv, kind="stable")]
+    ptr = np.r_[0, np.cumsum(np.bincount(inv, minlength=len(uniq)))]
+    return out, order, ptr
 
 
 # -----------------------------------------------------------------------------

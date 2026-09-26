@@ -356,7 +356,8 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
             if frame.empty:
                 continue
             pairs = idx.candidates(frame)
-            log(f"current [{c}] {name}: {len(frame):,} S1 -> {len(pairs):,} pairs ({len(pairs) / len(frame):.1f}/S1); features")
+            n_exp = int(pairs["expanded"].sum()) if "expanded" in pairs else 0
+            log(f"current [{c}] {name}: {len(frame):,} S1 -> {len(pairs):,} pairs ({len(pairs) / len(frame):.1f}/S1, {n_exp:,} from expansion); features")
             feats = pc.build_features(idx, frame, pairs)
             s1_ids = frame["entity_id"].to_numpy()[feats["s1_idx"].to_numpy()]
             cand_ids = pool_ids[feats["t_idx"].to_numpy()]
