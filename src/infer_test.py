@@ -17,6 +17,7 @@ import gc
 import os
 import subprocess
 import sys
+import time
 
 import numpy as np
 import pandas as pd
@@ -98,14 +99,19 @@ def predict_test(model, test_dir, output_dir, chunk):
         S, T, P = [], [], []
         for lo in range(0, len(s1_c), chunk):
             part = s1_c.iloc[lo:lo + chunk].reset_index(drop=True)
+            t0 = time.time()
             pairs = idx.candidates(part)
+            t1 = time.time()
             feats = pc.build_features(idx, part, pairs, rivals=rivals)
+            t2 = time.time()
             prob, kept = model.predict(feats)     # kept = pairs the final model scored
+            t3 = time.time()
+            timing = f"blocking {t1 - t0:.0f}s, features {t2 - t1:.0f}s, model {t3 - t2:.0f}s"
             S.append(feats["s1_idx"].to_numpy().astype(np.int64)[kept] + lo)
             T.append(feats["t_idx"].to_numpy().astype(np.int64)[kept])
             P.append(prob[kept])
             log(f"test [{c}]: scored {min(lo + chunk, len(s1_c)):,}/{len(s1_c):,} S1 "
-                f"({len(feats) / len(part):.1f} blocked, {kept.sum() / len(part):.1f} scored by final model per S1)")
+                f"({len(feats) / len(part):.1f} blocked, {kept.sum() / len(part):.1f} scored by final model per S1; {timing})")
             del feats, pairs
         S, T, P = np.concatenate(S), np.concatenate(T), np.concatenate(P)
         own = pc.one_owner(S, T, P)               # global over the whole country

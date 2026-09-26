@@ -75,18 +75,35 @@ def _safe_div(a, b):
         return np.where(b > 0, a / b, np.nan).astype(np.float32)
 
 
-def pair_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_mats, t_mats, space: TokenSpace,
+class Records:
+    """Column arrays + string lengths of a normalized frame, computed once. Building these per call
+    for a 4-6M record pool was the main per-chunk cost of test inference."""
+    COLS = ("entity_id", "name_norm", "name_core", "name_compact", "addr_norm", "house_number")
+
+    def __init__(self, df: pd.DataFrame):
+        self.obj = {c: df[c].to_numpy(dtype=object) for c in self.COLS if c in df}
+        self.len = {c: df[c].str.len().to_numpy() for c in self.COLS if c in df and c != "entity_id"}
+        self.is_s2 = df["entity_id"].str.startswith("S2-").to_numpy()
+        self.n = len(df)
+
+
+def pair_features(s1, tgt, s1_mats, t_mats, space: TokenSpace,
                   s1_idx: np.ndarray, t_idx: np.ndarray) -> pd.DataFrame:
-    """Row-aligned features for pairs (s1_idx[i], t_idx[i]). Group/rank features are added separately."""
+    """Row-aligned features for pairs (s1_idx[i], t_idx[i]). s1 / tgt: DataFrame or Records.
+    Group/rank features are added separately."""
     f = {}
-    col = lambda df, c, idx: df[c].to_numpy(dtype=object)[idx]
+    r1 = s1 if isinstance(s1, Records) else Records(s1)
+    r2 = tgt if isinstance(tgt, Records) else Records(tgt)
+    recs = {id(s1): r1, id(tgt): r2}
+    col = lambda df, c, idx: recs[id(df)].obj[c][idx]
+    ln = lambda df, c, idx: recs[id(df)].len[c][idx]
     n1, n2 = col(s1, "name_norm", s1_idx), col(tgt, "name_norm", t_idx)
     c1, c2 = col(s1, "name_core", s1_idx), col(tgt, "name_core", t_idx)
     a1, a2 = col(s1, "addr_norm", s1_idx), col(tgt, "addr_norm", t_idx)
 
-    name_empty = (s1["name_norm"].str.len().to_numpy()[s1_idx] == 0) | (tgt["name_norm"].str.len().to_numpy()[t_idx] == 0)
-    core_empty = (s1["name_core"].str.len().to_numpy()[s1_idx] == 0) | (tgt["name_core"].str.len().to_numpy()[t_idx] == 0)
-    addr_empty = (s1["addr_norm"].str.len().to_numpy()[s1_idx] == 0) | (tgt["addr_norm"].str.len().to_numpy()[t_idx] == 0)
+    name_empty = (ln(s1, "name_norm", s1_idx) == 0) | (ln(tgt, "name_norm", t_idx) == 0)
+    core_empty = (ln(s1, "name_core", s1_idx) == 0) | (ln(tgt, "name_core", t_idx) == 0)
+    addr_empty = (ln(s1, "addr_norm", s1_idx) == 0) | (ln(tgt, "addr_norm", t_idx) == 0)
 
     # 1. name strings
     f["name_jw"] = _pairwise(JaroWinkler.normalized_similarity, n1, n2)
@@ -117,11 +134,11 @@ def pair_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_mats, t_mats, space: T
     f["addr_tsort"] = _pairwise(fuzz.token_sort_ratio, a1, a2, 100.0)
     for k in ["addr_jw", "addr_lcs", "addr_tset", "addr_tsort"]:
         f[k][addr_empty] = np.nan
-    f["addr_missing"] = (tgt["addr_norm"].str.len().to_numpy()[t_idx] == 0).astype(np.float32)
+    f["addr_missing"] = (ln(tgt, "addr_norm", t_idx) == 0).astype(np.float32)
 
     # 3. house / street number: +1 same, -1 different, 0 when either side has none
     h1, h2 = col(s1, "house_number", s1_idx), col(tgt, "house_number", t_idx)
-    has = (s1["house_number"].str.len().to_numpy()[s1_idx] > 0) & (tgt["house_number"].str.len().to_numpy()[t_idx] > 0)
+    has = (ln(s1, "house_number", s1_idx) > 0) & (ln(tgt, "house_number", t_idx) > 0)
     f["hn_match"] = np.where(has, np.where(h1 == h2, 1.0, -1.0), 0.0).astype(np.float32)
 
     # 4. IDF-weighted token overlap (names, address words) and address-component overlap
@@ -154,12 +171,12 @@ def pair_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_mats, t_mats, space: T
         f[k][addr_empty] = np.nan
 
     # 5. structure
-    l1, l2 = s1["name_norm"].str.len().to_numpy()[s1_idx], tgt["name_norm"].str.len().to_numpy()[t_idx]
+    l1, l2 = ln(s1, "name_norm", s1_idx), ln(tgt, "name_norm", t_idx)
     f["name_len_ratio"] = _safe_div(np.minimum(l1, l2), np.maximum(l1, l2))
-    l1, l2 = s1["addr_norm"].str.len().to_numpy()[s1_idx], tgt["addr_norm"].str.len().to_numpy()[t_idx]
+    l1, l2 = ln(s1, "addr_norm", s1_idx), ln(tgt, "addr_norm", t_idx)
     f["addr_len_ratio"] = _safe_div(np.minimum(l1, l2), np.maximum(l1, l2))
     f["addr_len_ratio"][addr_empty] = np.nan
-    f["is_s2"] = np.char.startswith(tgt["entity_id"].to_numpy(dtype=str)[t_idx], "S2-").astype(np.float32)
+    f["is_s2"] = r2.is_s2[t_idx].astype(np.float32)
     return pd.DataFrame(f)
 
 

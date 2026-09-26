@@ -26,7 +26,7 @@ from sklearn.model_selection import GroupKFold
 
 from src.decision import decide, macro_f05_arrays, one_owner, tune
 from rapidfuzz import fuzz, process
-from src.features import TokenSpace, add_group_features, pair_features
+from src.features import Records, TokenSpace, add_group_features, pair_features
 from src.normalization import preprocess_dataframe
 
 NORM_COLS = ["entity_id", "country", "name_norm", "name_core", "name_compact", "addr_norm", "house_number"]
@@ -121,6 +121,7 @@ class CountryIndex:
         self.T = {n: m.T.tocsr() for n, m in self.TT.items()}   # targets x features (word views are small)
         self.space = TokenSpace().fit(self.pool, *extra)
         self.t_mats = self.space.transform(self.pool)
+        self.rec = Records(self.pool)                           # column arrays computed once
         # exact-twin groups for sibling expansion (records of one business often share the exact
         # normalized address or compact name); large groups are generic and skipped
         self.expand = expand
@@ -199,9 +200,9 @@ class CountryIndex:
         i.e. candidates whose name and address both closely match the S1 record."""
         s_idx, t_idx = pairs["s1_idx"].to_numpy(), pairs["t_idx"].to_numpy()
         n1 = s1["name_norm"].to_numpy(dtype=object)[s_idx]
-        n2 = self.pool["name_norm"].to_numpy(dtype=object)[t_idx]
+        n2 = self.rec.obj["name_norm"][t_idx]
         a1 = s1["addr_norm"].to_numpy(dtype=object)[s_idx]
-        a2 = self.pool["addr_norm"].to_numpy(dtype=object)[t_idx]
+        a2 = self.rec.obj["addr_norm"][t_idx]
         name_ts = process.cpdist(n1, n2, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
         addr_ts = process.cpdist(a1, a2, scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
         anchor = (name_ts >= 90) & (addr_ts >= 80)
@@ -317,10 +318,11 @@ class RivalIndex:
 def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, chunk: int = 1_000_000,
                    rivals: Optional["RivalIndex"] = None) -> pd.DataFrame:
     s1_mats = index.space.transform(s1)
+    s1_rec = Records(s1)
     out = []
     for lo in range(0, len(pairs), chunk):
         p = pairs.iloc[lo:lo + chunk]
-        f = pair_features(s1, index.pool, s1_mats, index.t_mats, index.space,
+        f = pair_features(s1_rec, index.rec, s1_mats, index.t_mats, index.space,
                           p["s1_idx"].to_numpy(), p["t_idx"].to_numpy())
         f.index = p.index
         out.append(f)
@@ -328,7 +330,7 @@ def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, c
     cos_cols = [c for c in pairs.columns if c.startswith("cos_")]
     t = feats["t_idx"].to_numpy()
     for col, src in [("_t_name", "name_norm"), ("_t_addr", "addr_norm"), ("_t_compact", "name_compact")]:
-        feats[col] = index.pool[src].to_numpy(dtype=object)[t]
+        feats[col] = index.rec.obj[src][t]
     feats["cos_max"] = feats[cos_cols].max(axis=1)
     feats["cos_mean"] = feats[cos_cols].mean(axis=1)
     # how many pool records share the candidate's exact compact name (size of its twin group)
