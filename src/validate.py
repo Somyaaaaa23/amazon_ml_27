@@ -352,9 +352,21 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
         ev_c = ev_n[ev_n["country"] == c].reset_index(drop=True)
         log(f"current [{c}]: pool {len(pool):,}; building index")
         idx = pc.CountryIndex(pool, extra=[tr_c, ev_c], views=views)
-        rivals = None
-        if s1_all is not None and hasattr(pc, "RivalIndex"):   # every training S1 of the country (unlabeled)
-            rivals = pc.RivalIndex(pc.normalize(s1_all[s1_all["country"] == c]))
+        riv = {}
+        if s1_all is not None and hasattr(pc, "RivalIndex"):
+            # Rival pool = the country's S1 records (unlabeled). The test set looks like ~20% of the
+            # businesses were removed from S1 while their S2/S3 records stayed, so a share of the other
+            # S1 entities can be dropped to simulate that. The sampled train/eval S1 are never dropped.
+            s1c = s1_all[s1_all["country"] == c]
+            protected = s1c["entity_id"].isin(set(tr_c["entity_id"]) | set(ev_c["entity_id"])).to_numpy()
+            u = np.random.default_rng(1).random(len(s1c))
+            s1c_n = pc.normalize(s1c)
+            for name, frac in [("train", kw.get("rival_drop_train", 0.0)), ("eval", kw.get("rival_drop_eval", 0.0))]:
+                keep = protected | (u >= frac)
+                riv[name] = pc.RivalIndex(s1c_n[keep].reset_index(drop=True))
+            log(f"current [{c}]: rival pools train {len(s1c_n) - int((~(protected | (u >= kw.get('rival_drop_train', 0.0)))).sum()):,} / "
+                f"eval {len(s1c_n) - int((~(protected | (u >= kw.get('rival_drop_eval', 0.0)))).sum()):,} of {len(s1c_n):,} S1")
+            del s1c_n
         pool_ids = idx.pool["entity_id"].to_numpy()
         for name, frame, parts in [("train", tr_c, train_parts), ("eval", ev_c, eval_parts)]:
             if frame.empty:
@@ -362,6 +374,7 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
             pairs = idx.candidates(frame)
             n_exp = int(pairs["expanded"].sum()) if "expanded" in pairs else 0
             log(f"current [{c}] {name}: {len(frame):,} S1 -> {len(pairs):,} pairs ({len(pairs) / len(frame):.1f}/S1, {n_exp:,} from expansion); features")
+            rivals = riv.get(name)
             feats = pc.build_features(idx, frame, pairs, rivals=rivals) if rivals is not None else pc.build_features(idx, frame, pairs)
             s1_ids = frame["entity_id"].to_numpy()[feats["s1_idx"].to_numpy()]
             cand_ids = pool_ids[feats["t_idx"].to_numpy()]
@@ -373,7 +386,7 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
             feats["_country"] = c
             parts.append(feats)
         offset += len(pool) + 1
-        del idx, pool, rivals
+        del idx, pool, riv
         gc.collect()
 
     train = pd.concat(train_parts, ignore_index=True)
@@ -417,6 +430,10 @@ def append_results(name, args, res, cv_info, minutes):
                     "| run | code | train → eval | scope | recall ceiling | avg cands | macro F0.5 | singleton acc | matches F0.5 | CV F0.5 (OOF) | minutes |\n"
                     "|---|---|---|---|---|---|---|---|---|---|---|\n")
         tr_desc = f"{args.n_train//1000}k {'+'.join(args.train_countries or ['all'])} → {args.n_eval//1000}k {'+'.join(args.eval_countries or ['all'])}"
+        if getattr(args, "rival_drop_eval", 0) or getattr(args, "rival_drop_train", 0):
+            tr_desc += f" (rival drop train {args.rival_drop_train:g} / eval {args.rival_drop_eval:g})"
+        if getattr(args, "prune_k", None):
+            tr_desc += f" (top-{args.prune_k})"
         cv_txt = f"{cv_info.get('cv_macro_f05', float('nan')):.4f}" if cv_info else "-"
         for scope, r in res.items():
             f.write(f"| {name} | {args.adapter} | {tr_desc} | {scope} | {r['recall_ceiling']*100:.2f}% | {r['avg_cands']:.1f} | "
@@ -435,6 +452,8 @@ def main():
     ap.add_argument("--eval-countries", nargs="*")
     ap.add_argument("--no-results-md", action="store_true", help="smoke tests: do not append to RESULTS.md")
     ap.add_argument("--prune-k", type=int, default=None, help="current adapter: stage-1 top-k filter before the final model")
+    ap.add_argument("--rival-drop-train", type=float, default=0.0, help="share of other S1 removed from the rival pool when building training features")
+    ap.add_argument("--rival-drop-eval", type=float, default=0.0, help="same for evaluation features (0.2 ~ test conditions)")
     ap.add_argument("--smoke-pool-frac", type=float, default=None,
                     help="CODE-PATH TESTS ONLY: shrink S2/S3 pools to true matches of the sampled S1 + this "
                          "fraction of the rest. Scores are meaningless; implies --no-results-md.")
@@ -461,7 +480,8 @@ def main():
     if args.adapter == "current":
         data = {"s2": s2, "s3": s3, "s1": s1}
         del s2, s3, s1
-        cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev, prune_k=args.prune_k)
+        cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev, prune_k=args.prune_k,
+                                                rival_drop_train=args.rival_drop_train, rival_drop_eval=args.rival_drop_eval)
     else:
         del s1
         cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)

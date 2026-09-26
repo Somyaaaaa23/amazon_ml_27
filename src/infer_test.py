@@ -38,7 +38,7 @@ def pools_by_country(s2, s3, countries):
     return {c: pd.concat([s2[s2["country"] == c], s3[s3["country"] == c]], ignore_index=True) for c in countries}
 
 
-def train(train_dir, n_train, prune_k=None, seed=0):
+def train(train_dir, n_train, prune_k=None, rival_drop=0.0, seed=0):
     s1, s2, s3 = (read(os.path.join(train_dir, f"train_source{i}.tsv")) for i in (1, 2, 3))
     gt_df = pd.read_csv(os.path.join(train_dir, "train_ground_truth.tsv"), sep="\t", dtype=str, keep_default_na=False)
     gt = {k: [x for x in v.split(",") if x] for k, v in zip(gt_df["source1_entity_id"], gt_df["matched_entity_ids"])}
@@ -55,7 +55,11 @@ def train(train_dir, n_train, prune_k=None, seed=0):
         pool = pc.normalize(pools.pop(c))
         tr_c = tr_n[tr_n["country"] == c].reset_index(drop=True)
         idx = pc.CountryIndex(pool, extra=[tr_c])
-        rivals = pc.RivalIndex(pc.normalize(s1_by_c.pop(c)))    # every training S1 of the country
+        # rival pool: the country's training S1, minus a random share of the non-sampled ones to
+        # simulate the test set (where ~20% of businesses have S2/S3 records but no S1 entity)
+        s1c = s1_by_c.pop(c)
+        keep = s1c["entity_id"].isin(set(tr_c["entity_id"])).to_numpy() | (np.random.default_rng(1).random(len(s1c)) >= rival_drop)
+        rivals = pc.RivalIndex(pc.normalize(s1c[keep]))
         pairs = idx.candidates(tr_c)
         feats = pc.build_features(idx, tr_c, pairs, rivals=rivals)
         s1_ids = tr_c["entity_id"].to_numpy()[feats["s1_idx"].to_numpy()]
@@ -149,9 +153,10 @@ def main():
     ap.add_argument("--n-train", type=int, default=30000)
     ap.add_argument("--chunk", type=int, default=30000)
     ap.add_argument("--prune-k", type=int, default=None, help="stage 1 keeps the top-k candidates per S1 for the final model")
+    ap.add_argument("--rival-drop", type=float, default=0.0, help="share of non-sampled training S1 left out of the rival pool")
     args = ap.parse_args()
 
-    model = train(args.train_dir, args.n_train, args.prune_k)
+    model = train(args.train_dir, args.n_train, args.prune_k, args.rival_drop)
     log(f"model: decision {model.decision}, OOF {model.cv}")
     match_path, cand_path = predict_test(model, args.test_dir, args.output_dir, args.chunk)
     validator = os.path.join(PROJECT_ROOT, "student_resource", "utils", "validate_submission.py")
