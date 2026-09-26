@@ -13,3 +13,4 @@ cache/
 __pycache__/
 *.pyc
 .worktrees/
+output_run2/
