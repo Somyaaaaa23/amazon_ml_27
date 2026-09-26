@@ -145,11 +145,15 @@ NAME_ABBREVIATIONS = {
     r"\bintl\b": "international",
     r"\bmfg\b": "manufacturing",
     r"\btech\b": "technologies",
+    r"\bsaint\b": "st",
+    r"\bsainte\b": "ste",
 }
 
 ADDRESS_ABBREVIATIONS = {
     r"\brd\b": "road",
-    r"\bst\b": "street",
+    # "st" is Street in US addresses but Saint in French ones ("ST.-HERBLAIN"); both sides map to one
+    # canonical token so either reading agrees. Same for ste = Suite / Sainte.
+    r"\b(?:street|saint|st)\b": "st",
     r"\bave\b": "avenue",
     r"\bblvd\b": "boulevard",
     r"\bln\b": "lane",
@@ -157,7 +161,7 @@ ADDRESS_ABBREVIATIONS = {
     r"\bct\b": "court",
     r"\bpkwy\b": "parkway",
     r"\bhwy\b": "highway",
-    r"\bste\b": "suite",
+    r"\b(?:suite|sainte|ste)\b": "ste",
     r"\bflr\b": "floor",
     r"\bindl\b": "industrial",
     r"\bph\b": "phase",
@@ -185,6 +189,9 @@ ADDRESS_ABBREVIATIONS = {
     r"\bimp\b": "impasse",
     r"\brte\b": "route",
     r"\bfg\b": "faubourg",
+    r"\ball\b": "allee",
+    r"\bch\b": "chemin",
+    r"\bcrs\b": "cours",
 }
 
 # Zero-padded numbers ("0031" vs "31", "Building No. 0253") are noise, not a different number
