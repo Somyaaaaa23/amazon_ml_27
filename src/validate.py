@@ -331,7 +331,8 @@ def adapter_antigravity(mods, s1, s2, s3, gt, tr, ev, top_k=20, qbatch=25):
 # and features for train and eval S1; then one model trained on all training pairs with
 # GroupKFold OOF tuning of the decision rule; eval decided per country (global one-owner).
 # -----------------------------------------------------------------------------
-def adapter_current(mods, s1, s2, s3, gt, tr, ev, **kw):
+def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
+    """data: {"s2": df, "s3": df}; emptied once the per-country pools are built (frees ~4 GB)."""
     pc = mods["pipeline_core"]
     views = kw.get("views")
     tr_n, ev_n = pc.normalize(tr), pc.normalize(ev)
@@ -339,7 +340,10 @@ def adapter_current(mods, s1, s2, s3, gt, tr, ev, **kw):
     train_parts, eval_parts = [], []
     offset = 0
     countries = sorted(set(tr["country"]) | set(ev["country"]))
+    s2, s3 = data.pop("s2"), data.pop("s3")
     pools = {c: pd.concat([s2[s2["country"] == c], s3[s3["country"] == c]], ignore_index=True) for c in countries}
+    del s2, s3
+    gc.collect()
     block_stats = {}
     for c in sorted(pools, key=lambda c: len(pools[c])):
         pool = pc.normalize(pools.pop(c))
@@ -447,7 +451,12 @@ def main():
     mods = load_modules(args.code_dir, ("pipeline_core",) if args.adapter == "current" else
                         ("normalization", "blocking", "features", "model", "postprocessing"))
 
-    cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)
+    if args.adapter == "current":
+        data = {"s2": s2, "s3": s3}
+        del s2, s3
+        cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev)
+    else:
+        cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)
     minutes = (time.time() - T0) / 60
 
     res = {}

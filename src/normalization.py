@@ -165,7 +165,30 @@ ADDRESS_ABBREVIATIONS = {
     r"\bopp\b": "opposite",
     r"\bnr\b": "near",
     r"\badj\b": "adjacent",
+    r"\btrl\b": "trail",
+    r"\bcir\b": "circle",
+    r"\bterr?\b": "terrace",
+    r"\bpky\b": "parkway",
+    r"\bsq\b": "square",
+    r"\bhts\b": "heights",
+    r"\bcres\b": "crescent",
+    r"\bxing\b": "crossing",
+    r"\bexpy\b": "expressway",
+    r"\bfwy\b": "freeway",
+    r"\bapt\b": "apartment",
+    r"\bbldg\b": "building",
+    r"\bche\b": "chemin",
+    r"\bchem\b": "chemin",
+    r"\bimp\b": "impasse",
+    r"\brte\b": "route",
+    r"\bfg\b": "faubourg",
 }
+
+# Zero-padded numbers ("0031" vs "31", "Building No. 0253") are noise, not a different number
+_LEADING_ZEROS = re.compile(r"(?<!\d)0+(?=\d)")
+# Website-style names ("highlandintelligence.com", "www.gilddova.com") and junk ids in names
+_URL_PARTS = re.compile(r"https?://|\bwww\.|\.(?:co\.in|com|net|org|in|fr|biz|info|io|us)\b")
+_NAME_JUNK = re.compile(r"\bid\s*[:#]?\s*\d+|\b\d{6,}\b|\bd\s*/\s*b\s*/\s*a\b|\bdba\b")
 
 # Regex for landmark extraction
 LANDMARK_PATTERN = re.compile(
@@ -209,6 +232,9 @@ def normalize_name(raw_name: str) -> Tuple[str, str]:
 
     # Apostrophes join rather than split ("Orelee's" -> "orelees")
     text = re.sub(r"['\u2019`]", "", text)
+    text = _URL_PARTS.sub(" ", text)
+    text = _NAME_JUNK.sub(" ", text)
+    text = _LEADING_ZEROS.sub("", text)
 
     # Normalize ampersands & special characters
     text = re.sub(r"\s*&\s*", " and ", text)
@@ -245,6 +271,8 @@ def normalize_address(raw_addr: str) -> Tuple[str, str, str, bool]:
     if lm_match:
         landmark = lm_match.group(0).strip()
 
+    text = _LEADING_ZEROS.sub("", text)
+
     # Extract house / plot number
     house_num = extract_house_number(text)
 
@@ -280,6 +308,7 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     name_tuples = [normalize_name(x) for x in df["business_name"]]
     df["name_norm"] = [t[0] for t in name_tuples]
     df["name_core"] = [t[1] for t in name_tuples]
+    df["name_compact"] = df["name_core"].str.replace(" ", "", regex=False)
 
     addr_tuples = [normalize_address(x) for x in df["business_address"]]
     df["addr_norm"] = [t[0] for t in addr_tuples]

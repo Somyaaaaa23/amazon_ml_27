@@ -28,7 +28,7 @@ from src.decision import decide, macro_f05_arrays, one_owner, tune
 from src.features import TokenSpace, add_group_features, pair_features
 from src.normalization import preprocess_dataframe
 
-NORM_COLS = ["entity_id", "country", "name_norm", "name_core", "addr_norm", "house_number"]
+NORM_COLS = ["entity_id", "country", "name_norm", "name_core", "name_compact", "addr_norm", "house_number"]
 T0 = time.time()
 
 

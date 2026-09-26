@@ -102,6 +102,13 @@ def pair_features(s1: pd.DataFrame, tgt: pd.DataFrame, s1_mats, t_mats, space: T
     f["core_jw"][core_empty] = np.nan
     f["core_tset"][core_empty] = np.nan
     f["core_exact"] = ((c1 == c2) & ~core_empty).astype(np.float32)
+    # compact core name (spaces removed) catches "highlandintelligence(.com)" vs "Highland Intelligence Inc"
+    k1, k2 = col(s1, "name_compact", s1_idx), col(tgt, "name_compact", t_idx)
+    f["compact_partial"] = _pairwise(fuzz.partial_ratio, k1, k2, 100.0)
+    f["compact_ratio"] = _pairwise(fuzz.ratio, k1, k2, 100.0)
+    f["compact_partial"][core_empty] = np.nan
+    f["compact_ratio"][core_empty] = np.nan
+    f["compact_exact"] = ((k1 == k2) & ~core_empty).astype(np.float32)
 
     # 2. address strings
     f["addr_jw"] = _pairwise(JaroWinkler.normalized_similarity, a1, a2)
