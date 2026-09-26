@@ -260,7 +260,62 @@ def _compact_codes(codes):
 # -----------------------------------------------------------------------------
 # Features
 # -----------------------------------------------------------------------------
-def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, chunk: int = 1_000_000) -> pd.DataFrame:
+class RivalIndex:
+    """All S1 records of one country (unlabeled), grouped by name, to tell how ambiguous an S1 name is
+    and whether a candidate fits a rival S1 with the same name better. At training time this is every
+    training S1 of the country, at test time every test S1 of the country."""
+
+    def __init__(self, s1_all: pd.DataFrame, max_rivals: int = 20):
+        self.ids = {k: i for i, k in enumerate(s1_all["entity_id"])}
+        self.addr = s1_all["addr_norm"].to_numpy(dtype=object)
+        self.name = s1_all["name_norm"].to_numpy(dtype=object)
+        tokkey = s1_all["name_core"].map(lambda x: " ".join(sorted(set(x.split()))))
+        self.max_rivals = max_rivals
+        self.groups = {}
+        for key, values in [("compact", s1_all["name_compact"]), ("tokens", tokkey)]:
+            codes, _ = pd.factorize(values.where(values.str.len() > 0))
+            self.groups[key] = _compact_codes(codes)
+
+    def features(self, s1: pd.DataFrame, s1_idx: np.ndarray, t_name: np.ndarray, t_addr: np.ndarray,
+                 self_addr_tset: np.ndarray) -> pd.DataFrame:
+        rows = np.array([self.ids.get(k, -1) for k in s1["entity_id"]])[s1_idx]
+        n = len(s1_idx)
+        f = {}
+        for key, (codes, order, ptr) in self.groups.items():
+            c = np.where(rows >= 0, codes[np.maximum(rows, 0)], -1)
+            size = np.where(c >= 0, ptr[np.maximum(c, 0) + 1] - ptr[np.maximum(c, 0)], 1)
+            f[f"n_rival_{key}"] = (size - 1).astype(np.float32)
+        # address / name of the candidate vs rival S1s sharing the compact name
+        codes, order, ptr = self.groups["compact"]
+        c = np.where(rows >= 0, codes[np.maximum(rows, 0)], -1)
+        lens = np.where(c >= 0, np.minimum(ptr[np.maximum(c, 0) + 1] - ptr[np.maximum(c, 0)], self.max_rivals + 1), 0)
+        has = lens > 1
+        pr = np.flatnonzero(has)
+        rep = np.repeat(pr, lens[pr])
+        offs = np.repeat(ptr[c[pr]], lens[pr]) + (np.arange(lens[pr].sum()) - np.repeat(np.cumsum(lens[pr]) - lens[pr], lens[pr]))
+        riv = order[offs]
+        not_self = riv != rows[rep]
+        rep, riv = rep[not_self], riv[not_self]
+        addr_best = np.full(n, np.nan, dtype=np.float32)
+        name_best = np.full(n, np.nan, dtype=np.float32)
+        if len(rep):
+            a_sim = process.cpdist(t_addr[rep], self.addr[riv], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
+            a_sim[pd.Series(t_addr[rep]).str.len().to_numpy() == 0] = np.nan
+            n_sim = process.cpdist(t_name[rep], self.name[riv], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
+            tmp = np.full(n, -1.0, dtype=np.float32)
+            np.fmax.at(tmp, rep, np.nan_to_num(a_sim, nan=-1.0))
+            addr_best = np.where(tmp >= 0, tmp, np.nan).astype(np.float32)
+            tmp = np.full(n, -1.0, dtype=np.float32)
+            np.fmax.at(tmp, rep, n_sim)
+            name_best = np.where(tmp >= 0, tmp, np.nan).astype(np.float32)
+        f["rival_addr_best"] = addr_best
+        f["rival_name_best"] = name_best
+        f["self_minus_rival_addr"] = (np.nan_to_num(self_addr_tset, nan=0.0) - addr_best).astype(np.float32)
+        return pd.DataFrame(f)
+
+
+def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, chunk: int = 1_000_000,
+                   rivals: Optional["RivalIndex"] = None) -> pd.DataFrame:
     s1_mats = index.space.transform(s1)
     out = []
     for lo in range(0, len(pairs), chunk):
@@ -276,6 +331,14 @@ def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, c
         feats[col] = index.pool[src].to_numpy(dtype=object)[t]
     feats["cos_max"] = feats[cos_cols].max(axis=1)
     feats["cos_mean"] = feats[cos_cols].mean(axis=1)
+    # how many pool records share the candidate's exact compact name (size of its twin group)
+    tc = index.compact_groups[0][t]
+    feats["t_compact_twins"] = np.where(tc >= 0, np.diff(index.compact_groups[2])[np.maximum(tc, 0)], 1).astype(np.float32)
+    if rivals is not None:
+        rf = rivals.features(s1, feats["s1_idx"].to_numpy(), feats["_t_name"].to_numpy(dtype=object),
+                             feats["_t_addr"].to_numpy(dtype=object), feats["addr_tset"].to_numpy())
+        rf.index = feats.index
+        feats = pd.concat([feats, rf], axis=1)
     return add_group_features(feats, "s1_idx", score_cols=("cos_comb", "cos_name", "name_tset", "addr_tset"))
 
 

@@ -341,6 +341,7 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
     offset = 0
     countries = sorted(set(tr["country"]) | set(ev["country"]))
     s2, s3 = data.pop("s2"), data.pop("s3")
+    s1_all = data.pop("s1", None)
     pools = {c: pd.concat([s2[s2["country"] == c], s3[s3["country"] == c]], ignore_index=True) for c in countries}
     del s2, s3
     gc.collect()
@@ -351,6 +352,9 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
         ev_c = ev_n[ev_n["country"] == c].reset_index(drop=True)
         log(f"current [{c}]: pool {len(pool):,}; building index")
         idx = pc.CountryIndex(pool, extra=[tr_c, ev_c], views=views)
+        rivals = None
+        if s1_all is not None and hasattr(pc, "RivalIndex"):   # every training S1 of the country (unlabeled)
+            rivals = pc.RivalIndex(pc.normalize(s1_all[s1_all["country"] == c]))
         pool_ids = idx.pool["entity_id"].to_numpy()
         for name, frame, parts in [("train", tr_c, train_parts), ("eval", ev_c, eval_parts)]:
             if frame.empty:
@@ -358,7 +362,7 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
             pairs = idx.candidates(frame)
             n_exp = int(pairs["expanded"].sum()) if "expanded" in pairs else 0
             log(f"current [{c}] {name}: {len(frame):,} S1 -> {len(pairs):,} pairs ({len(pairs) / len(frame):.1f}/S1, {n_exp:,} from expansion); features")
-            feats = pc.build_features(idx, frame, pairs)
+            feats = pc.build_features(idx, frame, pairs, rivals=rivals) if rivals is not None else pc.build_features(idx, frame, pairs)
             s1_ids = frame["entity_id"].to_numpy()[feats["s1_idx"].to_numpy()]
             cand_ids = pool_ids[feats["t_idx"].to_numpy()]
             feats["cand_key"] = feats["t_idx"].to_numpy().astype(np.int64) + offset
@@ -369,7 +373,7 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
             feats["_country"] = c
             parts.append(feats)
         offset += len(pool) + 1
-        del idx, pool
+        del idx, pool, rivals
         gc.collect()
 
     train = pd.concat(train_parts, ignore_index=True)
@@ -446,7 +450,6 @@ def main():
     log(f"loaded train: S1 {len(s1):,}  S2 {len(s2):,}  S3 {len(s3):,}; GT covers all S1")
     tr, ev = make_split(s1, args.n_train, args.n_eval, args.train_countries, args.eval_countries)
     log(f"train S1 {len(tr):,} {tr['country'].value_counts().to_dict()} | eval S1 {len(ev):,} {ev['country'].value_counts().to_dict()}")
-    del s1
     if args.smoke_pool_frac is not None:
         keep = set(chain.from_iterable(gt[k] for k in chain(tr["entity_id"], ev["entity_id"])))
         shrink = lambda d: d[d["entity_id"].isin(keep) | (np.random.default_rng(0).random(len(d)) < args.smoke_pool_frac)]
@@ -456,10 +459,11 @@ def main():
                         ("normalization", "blocking", "features", "model", "postprocessing"))
 
     if args.adapter == "current":
-        data = {"s2": s2, "s3": s3}
-        del s2, s3
+        data = {"s2": s2, "s3": s3, "s1": s1}
+        del s2, s3, s1
         cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev, prune_k=args.prune_k)
     else:
+        del s1
         cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)
     minutes = (time.time() - T0) / 60
 

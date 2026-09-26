@@ -48,13 +48,15 @@ def train(train_dir, n_train, prune_k=None, seed=0):
     tr_key = {k: i for i, k in enumerate(tr_n["entity_id"])}
     parts, offset = [], 0
     pools = pools_by_country(s2, s3, sorted(tr_n["country"].unique()))
+    s1_by_c = {c: s1[s1["country"] == c] for c in pools}
     del s1, s2, s3
     for c in sorted(pools, key=lambda c: len(pools[c])):
         pool = pc.normalize(pools.pop(c))
         tr_c = tr_n[tr_n["country"] == c].reset_index(drop=True)
         idx = pc.CountryIndex(pool, extra=[tr_c])
+        rivals = pc.RivalIndex(pc.normalize(s1_by_c.pop(c)))    # every training S1 of the country
         pairs = idx.candidates(tr_c)
-        feats = pc.build_features(idx, tr_c, pairs)
+        feats = pc.build_features(idx, tr_c, pairs, rivals=rivals)
         s1_ids = tr_c["entity_id"].to_numpy()[feats["s1_idx"].to_numpy()]
         cand_ids = idx.pool["entity_id"].to_numpy()[feats["t_idx"].to_numpy()]
         gt_set = {k: set(gt[k]) for k in set(s1_ids)}
@@ -91,12 +93,13 @@ def predict_test(model, test_dir, output_dir, chunk):
         if pool.empty:
             continue
         idx = pc.CountryIndex(pool, extra=[s1_c])
+        rivals = pc.RivalIndex(s1_c)                             # every test S1 of the country
         pool_ids = idx.pool["entity_id"].to_numpy()
         S, T, P = [], [], []
         for lo in range(0, len(s1_c), chunk):
             part = s1_c.iloc[lo:lo + chunk].reset_index(drop=True)
             pairs = idx.candidates(part)
-            feats = pc.build_features(idx, part, pairs)
+            feats = pc.build_features(idx, part, pairs, rivals=rivals)
             prob, kept = model.predict(feats)     # kept = pairs the final model scored
             S.append(feats["s1_idx"].to_numpy().astype(np.int64)[kept] + lo)
             T.append(feats["t_idx"].to_numpy().astype(np.int64)[kept])
