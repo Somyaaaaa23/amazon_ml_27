@@ -29,6 +29,8 @@ from rapidfuzz import fuzz, process
 from src.features import Records, TokenSpace, add_group_features, pair_features
 from src.normalization import preprocess_dataframe
 
+# forked workers for blocking queries (they share the index copy-on-write); override with ER_BLOCK_WORKERS
+BLOCK_WORKERS = int(os.environ.get("ER_BLOCK_WORKERS", "7"))
 NORM_COLS = ["entity_id", "country", "name_norm", "name_core", "name_compact", "addr_norm", "house_number"]  # + addr_key, name_key
 T0 = time.time()
 
@@ -180,7 +182,7 @@ class CountryIndex:
             return np.empty(0, np.int32), np.empty(0, np.int32), [np.empty(0, np.float32) for _ in self.views]
         return np.concatenate(s_out), np.concatenate(t_out), [np.concatenate(c) for c in cos_out]
 
-    def candidates(self, s1: pd.DataFrame, batch: int = 200, workers: int = 4) -> pd.DataFrame:
+    def candidates(self, s1: pd.DataFrame, batch: int = 200, workers: int = BLOCK_WORKERS) -> pd.DataFrame:
         """Union of the top-k of every view; returns pairs with the cosine of every view."""
         Q = {v.name: self.vecs[v.name].transform(s1[v.field]).tocsr() for v in self.views}
         spans = [(lo, min(lo + batch, len(s1))) for lo in range(0, len(s1), batch)]
