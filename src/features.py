@@ -41,6 +41,7 @@ class TokenSpace:
 
     def fit(self, *frames: pd.DataFrame) -> "TokenSpace":
         from src.pipeline_core import parallel_transform
+        frames = [f for f in frames if len(f)]      # e.g. a country with no training S1 in a proxy run
         n_docs = sum(len(f) for f in frames)
         for k, field in [("name", "name_norm"), ("addr", "addr_norm")]:
             df = sum(np.asarray(parallel_transform(self.vecs[k], f[field]).sum(axis=0)).ravel() for f in frames)

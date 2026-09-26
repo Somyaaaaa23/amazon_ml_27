@@ -106,6 +106,7 @@ class CountryIndex:
         """pool: normalized S2+S3 records of one country. extra: normalized S1 frames of the same
         country, used only as unlabeled text for fitting IDF statistics."""
         self.pool = pool.reset_index(drop=True)
+        extra = [e for e in extra if len(e)]
         self.views = views or DEFAULT_VIEWS
         self.vecs, self.TT = {}, {}
         for v in self.views:
