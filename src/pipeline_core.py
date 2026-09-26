@@ -110,7 +110,7 @@ def _qrun(args):
 
 class CountryIndex:
     def __init__(self, pool: pd.DataFrame, extra: Sequence[pd.DataFrame] = (), views: List[View] = None,
-                 fit_sample: Optional[int] = None, expand: bool = True):
+                 fit_sample: Optional[int] = None, expand: bool = True, hop2: bool = False):
         """pool: normalized S2+S3 records of one country. extra: normalized S1 frames of the same
         country, used only as unlabeled text for fitting IDF statistics."""
         self.pool = pool.reset_index(drop=True)
@@ -134,6 +134,7 @@ class CountryIndex:
         # exact-twin groups for sibling expansion (records of one business often share the exact
         # normalized address or compact name); large groups are generic and skipped
         self.expand = expand
+        self.hop2 = hop2
         self.addr_groups = _twin_groups(self.pool["addr_key"], min_len=10)
         self.compact_groups = _twin_groups(self.pool["name_compact"], min_len=6)
         self.namekey_groups = _twin_groups(self.pool["name_key"], min_len=6)
@@ -193,7 +194,64 @@ class CountryIndex:
         pairs["expanded"] = np.float32(0)
         if self.expand and len(pairs):
             pairs = self._expand(s1, Q, pairs)
+        if self.hop2 and len(pairs):
+            pairs = self._second_hop(s1, Q, pairs, workers=workers)
         return pairs
+
+    def _second_hop(self, s1: pd.DataFrame, Q, pairs: pd.DataFrame, n_anchor: int = 2, k2: int = 10,
+                    max_new: int = 15, workers: int = 4, batch: int = 400) -> pd.DataFrame:
+        """Records of one business resemble each other more than they resemble S1: use each S1's most
+        reliable candidates (by name+address similarity) as queries and add their nearest neighbours."""
+        s_idx, t_idx = pairs["s1_idx"].to_numpy(), pairs["t_idx"].to_numpy()
+        name_ts = process.cpdist(s1["name_norm"].to_numpy(dtype=object)[s_idx], self.rec.obj["name_norm"][t_idx],
+                                 scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
+        addr_ts = process.cpdist(s1["addr_norm"].to_numpy(dtype=object)[s_idx], self.rec.obj["addr_norm"][t_idx],
+                                 scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32)
+        score = np.where((name_ts >= 80) | (addr_ts >= 80), name_ts + addr_ts, -1.0)
+        rank = group_rank(s_idx, score)
+        sel = (rank <= n_anchor) & (score >= 0)
+        sa, ta = s_idx[sel], t_idx[sel]
+        if not len(sa):
+            return pairs
+        A = self.T["comb"][ta]
+        spans = [(lo, min(lo + batch, len(ta))) for lo in range(0, len(ta), batch)]
+
+        def run(lo, hi):
+            S = (A[lo:hi] @ self.TT["comb"]).tocsr()
+            rows, cols = [], []
+            for r in range(S.shape[0]):
+                a, b = S.indptr[r], S.indptr[r + 1]
+                d, ix = S.data[a:b], S.indices[a:b]
+                if len(d) > k2:
+                    ix = ix[np.argpartition(-d, k2)[:k2]]
+                rows.append(np.full(len(ix), lo + r, dtype=np.int64))
+                cols.append(ix.astype(np.int64))
+            return (np.concatenate(rows) if rows else np.empty(0, np.int64),
+                    np.concatenate(cols) if cols else np.empty(0, np.int64))
+
+        global _QFN
+        _QFN = run
+        if workers > 1 and len(spans) >= 2 * workers:
+            with mp.get_context("fork").Pool(workers) as pool:
+                res = pool.map(_qrun, spans, chunksize=1)
+        else:
+            res = [_qrun(sp_) for sp_ in spans]
+        _QFN = None
+        arow = np.concatenate([r[0] for r in res])
+        nbr = np.concatenate([r[1] for r in res])
+        N = len(self.pool) + 1
+        key_new = np.unique(sa[arow].astype(np.int64) * N + nbr)
+        key_new = key_new[~np.isin(key_new, s_idx.astype(np.int64) * N + t_idx)]
+        ns, nt = (key_new // N).astype(np.int32), (key_new % N).astype(np.int32)
+        first = np.r_[0, np.flatnonzero(ns[1:] != ns[:-1]) + 1] if len(ns) else np.empty(0, int)
+        rk = np.arange(len(ns)) - np.repeat(first, np.diff(np.r_[first, len(ns)])) if len(ns) else np.empty(0, int)
+        keep = rk < max_new
+        ns, nt = ns[keep], nt[keep]
+        add = pd.DataFrame({"s1_idx": ns, "t_idx": nt, **self._cos(Q, ns, nt)})
+        add["expanded"] = np.float32(0)
+        pairs = pairs.assign(hop2=np.float32(0))
+        add["hop2"] = np.float32(1)
+        return pd.concat([pairs, add], ignore_index=True)
 
     def _cos(self, Q, s_idx, t_idx):
         out = {}
