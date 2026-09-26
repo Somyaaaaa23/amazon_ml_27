@@ -12,3 +12,6 @@ Notes on `baseline_original`: the original logic (commit 57fc86f) including its 
 run-enabling shims were added (queries in batches of 25 rows over 4 forked workers, float32 TF-IDF,
 features built on candidate targets only). CV F0.5 is measured on that easy training pool, which is why it is
 far above the full-pool holdout score. PYTHONHASHSEED=0 (the original truncates a set in hash order).
+| current_v1 | current | 30k all → 30k all | India | 93.09% | 52.0 | 0.9419 | 0.9285 | 0.9426 |  | 57 |
+| current_v1 | current | 30k all → 30k all | US | 98.09% | 50.0 | 0.9661 | 0.9439 | 0.9674 |  | 57 |
+| current_v1 | current | 30k all → 30k all | ALL | 96.08% | 50.8 | 0.9564 | 0.9379 | 0.9575 | 0.9557 | 57 |
