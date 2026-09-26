@@ -377,12 +377,14 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
     n_true = np.array([len(gt[k]) for k in tr_n["entity_id"]])
     log(f"current: {len(train):,} training pairs ({int(train['label'].sum()):,} positive); training")
     meta = ["_s1", "_cand", "_country"]
-    model, oof = pc.train_model(train.drop(columns=meta), n_true, len(tr_n))
+    model, oof = pc.train_model(train.drop(columns=meta), n_true, len(tr_n), **({"prune_k": kw["prune_k"]} if kw.get("prune_k") else {}))
     cv_info = {"threshold": model.decision, "cv_macro_f05": model.cv["oof_macro_f05"], **model.cv}
 
     cands, preds = defaultdict(list), defaultdict(list)
     for feats in eval_parts:
-        prob = model.predict(feats)
+        out = model.predict(feats)
+        prob, kept = out if isinstance(out, tuple) else (out, np.ones(len(out), dtype=bool))
+        feats, prob = feats[kept], prob[kept]      # candidate set = pairs the final model scored
         s_key = pd.factorize(feats["_s1"])[0]
         own = pc.one_owner(s_key, feats["cand_key"].to_numpy(), prob)
         keep = pc.decide(s_key, prob, own, **model.decision)
@@ -428,6 +430,7 @@ def main():
     ap.add_argument("--train-countries", nargs="*")
     ap.add_argument("--eval-countries", nargs="*")
     ap.add_argument("--no-results-md", action="store_true", help="smoke tests: do not append to RESULTS.md")
+    ap.add_argument("--prune-k", type=int, default=None, help="current adapter: stage-1 top-k filter before the final model")
     ap.add_argument("--smoke-pool-frac", type=float, default=None,
                     help="CODE-PATH TESTS ONLY: shrink S2/S3 pools to true matches of the sampled S1 + this "
                          "fraction of the rest. Scores are meaningless; implies --no-results-md.")
@@ -455,7 +458,7 @@ def main():
     if args.adapter == "current":
         data = {"s2": s2, "s3": s3}
         del s2, s3
-        cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev)
+        cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev, prune_k=args.prune_k)
     else:
         cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)
     minutes = (time.time() - T0) / 60

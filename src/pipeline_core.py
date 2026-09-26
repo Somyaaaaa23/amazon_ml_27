@@ -391,6 +391,17 @@ def fit_oof(X, y, groups, n_splits=5, tag=""):
     return oof, final, n_est
 
 
+def group_rank(key: np.ndarray, p: np.ndarray) -> np.ndarray:
+    """1-based rank of p (descending) within each key group."""
+    order = np.lexsort((-p, key))
+    sk = key[order]
+    starts = np.r_[0, np.flatnonzero(sk[1:] != sk[:-1]) + 1]
+    sizes = np.diff(np.r_[starts, len(sk)])
+    rank = np.empty(len(p), dtype=np.int64)
+    rank[order] = np.arange(len(p)) - np.repeat(starts, sizes) + 1
+    return rank
+
+
 @dataclass
 class TrainedModel:
     stage1: lgb.LGBMClassifier
@@ -399,17 +410,27 @@ class TrainedModel:
     cols2: List[str]
     decision: Dict[str, float]
     cv: Dict[str, float] = field(default_factory=dict)
+    prune_k: Optional[int] = None     # stage 1 keeps the top-k candidates per S1 for stage 2
 
-    def predict(self, feats: pd.DataFrame, key_col: str = "s1_idx") -> np.ndarray:
+    def predict(self, feats: pd.DataFrame, key_col: str = "s1_idx"):
+        """Returns (probability, kept): kept marks the pairs the final model scored (the candidate
+        set written to candidate_pairs.tsv); probability is 0 for pruned pairs."""
         X1 = feats[self.cols1].to_numpy(np.float32)
         p1 = self.stage1.predict_proba(X1)[:, 1]
+        kept = np.ones(len(p1), dtype=bool)
         if self.stage2 is None:
-            return p1
-        sib = sibling_inputs(feats, key_col, p1)
-        return self.stage2.predict_proba(np.hstack([X1, sib[self.cols2].to_numpy(np.float32)]))[:, 1]
+            return p1, kept
+        if self.prune_k:
+            kept = group_rank(feats[key_col].to_numpy(), p1) <= self.prune_k
+        sub = feats[kept]
+        sib = sibling_inputs(sub, key_col, p1[kept])
+        p = np.zeros(len(p1))
+        p[kept] = self.stage2.predict_proba(np.hstack([X1[kept], sib[self.cols2].to_numpy(np.float32)]))[:, 1]
+        return p, kept
 
 
-def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: int = 5, two_stage: bool = True):
+def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: int = 5, two_stage: bool = True,
+                prune_k: Optional[int] = None):
     """feats: training pairs with 'label', 's1_key' (0..n_s1-1, unique over countries), 'cand_key'
     (unique target id) and the _t_* target strings. n_true[s1_key] = number of true matches
     (including ones blocking missed). The decision rule is tuned on the OOF probabilities of the
@@ -428,13 +449,21 @@ def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: in
         cv.update({"oof_macro_f05": best1["macro_f05"], "oof_singleton_acc": best1["singleton_accuracy"],
                    "oof_matches_f05": best1["matches_macro_f05"], **params1})
         return TrainedModel(m1, cols1, None, [], params1, cv), oof1
-    sib = sibling_inputs(feats, "s1_key", oof1)
+    keep = np.ones(len(y), dtype=bool)
+    if prune_k:
+        keep = group_rank(groups, oof1) <= prune_k
+        log(f"  prune to top-{prune_k} by stage-1 OOF: keeps {keep.mean():.3f} of pairs and "
+            f"{y[keep].sum() / max(y.sum(), 1):.4f} of blocked true pairs")
+    feats_k, X1k, yk, gk, ck = feats[keep], X1[keep], y[keep], groups[keep], cand[keep]
+    sib = sibling_inputs(feats_k, "s1_key", oof1[keep])
     cols2 = list(sib.columns)
-    X2 = np.hstack([X1, sib.to_numpy(np.float32)])
-    oof2, m2, n2 = fit_oof(X2, y, groups, n_splits, "stage2")
-    params2, best2, _ = tune(groups, cand, oof2, y.astype(bool), n_true, n_s1, ts=DECISION_GRID["ts"],
+    X2 = np.hstack([X1k, sib.to_numpy(np.float32)])
+    oof2, m2, n2 = fit_oof(X2, yk, gk, n_splits, "stage2")
+    params2, best2, _ = tune(gk, ck, oof2, yk.astype(bool), n_true, n_s1, ts=DECISION_GRID["ts"],
                              t_tops=DECISION_GRID["t_tops"], rels=DECISION_GRID["rels"])
     log(f"  stage2 OOF macro F0.5={best2['macro_f05']:.4f} singleton_acc={best2['singleton_accuracy']:.4f} with {params2}")
     cv.update({"oof_macro_f05": best2["macro_f05"], "oof_singleton_acc": best2["singleton_accuracy"],
                "oof_matches_f05": best2["matches_macro_f05"], "n_estimators": [n1, n2], **params2})
-    return TrainedModel(m1, cols1, m2, cols2, params2, cv), oof2
+    oof = np.zeros(len(y))
+    oof[keep] = oof2
+    return TrainedModel(m1, cols1, m2, cols2, params2, cv, prune_k), oof

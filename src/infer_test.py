@@ -37,7 +37,7 @@ def pools_by_country(s2, s3, countries):
     return {c: pd.concat([s2[s2["country"] == c], s3[s3["country"] == c]], ignore_index=True) for c in countries}
 
 
-def train(train_dir, n_train, seed=0):
+def train(train_dir, n_train, prune_k=None, seed=0):
     s1, s2, s3 = (read(os.path.join(train_dir, f"train_source{i}.tsv")) for i in (1, 2, 3))
     gt_df = pd.read_csv(os.path.join(train_dir, "train_ground_truth.tsv"), sep="\t", dtype=str, keep_default_na=False)
     gt = {k: [x for x in v.split(",") if x] for k, v in zip(gt_df["source1_entity_id"], gt_df["matched_entity_ids"])}
@@ -69,7 +69,7 @@ def train(train_dir, n_train, seed=0):
         gc.collect()
     train_df = pd.concat(parts, ignore_index=True)
     n_true = np.array([len(gt[k]) for k in tr_n["entity_id"]])
-    model, _ = pc.train_model(train_df, n_true, len(tr_n))
+    model, _ = pc.train_model(train_df, n_true, len(tr_n), prune_k=prune_k)
     return model
 
 
@@ -97,10 +97,12 @@ def predict_test(model, test_dir, output_dir, chunk):
             part = s1_c.iloc[lo:lo + chunk].reset_index(drop=True)
             pairs = idx.candidates(part)
             feats = pc.build_features(idx, part, pairs)
-            S.append(feats["s1_idx"].to_numpy().astype(np.int64) + lo)
-            T.append(feats["t_idx"].to_numpy().astype(np.int64))
-            P.append(model.predict(feats))
-            log(f"test [{c}]: scored {min(lo + chunk, len(s1_c)):,}/{len(s1_c):,} S1 ({len(feats) / len(part):.1f} cands/S1)")
+            prob, kept = model.predict(feats)     # kept = pairs the final model scored
+            S.append(feats["s1_idx"].to_numpy().astype(np.int64)[kept] + lo)
+            T.append(feats["t_idx"].to_numpy().astype(np.int64)[kept])
+            P.append(prob[kept])
+            log(f"test [{c}]: scored {min(lo + chunk, len(s1_c)):,}/{len(s1_c):,} S1 "
+                f"({len(feats) / len(part):.1f} blocked, {kept.sum() / len(part):.1f} scored by final model per S1)")
             del feats, pairs
         S, T, P = np.concatenate(S), np.concatenate(T), np.concatenate(P)
         own = pc.one_owner(S, T, P)               # global over the whole country
@@ -137,9 +139,10 @@ def main():
     ap.add_argument("--output-dir", default=os.path.join(PROJECT_ROOT, "output"))
     ap.add_argument("--n-train", type=int, default=30000)
     ap.add_argument("--chunk", type=int, default=30000)
+    ap.add_argument("--prune-k", type=int, default=None, help="stage 1 keeps the top-k candidates per S1 for the final model")
     args = ap.parse_args()
 
-    model = train(args.train_dir, args.n_train)
+    model = train(args.train_dir, args.n_train, args.prune_k)
     log(f"model: decision {model.decision}, OOF {model.cv}")
     match_path, cand_path = predict_test(model, args.test_dir, args.output_dir, args.chunk)
     validator = os.path.join(PROJECT_ROOT, "student_resource", "utils", "validate_submission.py")
