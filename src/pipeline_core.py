@@ -25,6 +25,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import GroupKFold
 
 from src.decision import decide, macro_f05_arrays, one_owner, tune
+from rapidfuzz import fuzz, process
 from src.features import TokenSpace, add_group_features, pair_features
 from src.normalization import preprocess_dataframe
 
@@ -189,6 +190,9 @@ def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, c
         out.append(f)
     feats = pd.concat([pairs] + [pd.concat(out)], axis=1) if out else pairs
     cos_cols = [c for c in pairs.columns if c.startswith("cos_")]
+    t = feats["t_idx"].to_numpy()
+    for col, src in [("_t_name", "name_norm"), ("_t_addr", "addr_norm"), ("_t_compact", "name_compact")]:
+        feats[col] = index.pool[src].to_numpy(dtype=object)[t]
     feats["cos_max"] = feats[cos_cols].max(axis=1)
     feats["cos_mean"] = feats[cos_cols].mean(axis=1)
     return add_group_features(feats, "s1_idx", score_cols=("cos_comb", "cos_name", "name_tset", "addr_tset"))
@@ -196,7 +200,87 @@ def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, c
 
 def feature_columns(df: pd.DataFrame) -> List[str]:
     skip = {"s1_idx", "t_idx", "label", "s1_key", "cand_key", "prob", "fold"}
-    return [c for c in df.columns if c not in skip]
+    return [c for c in df.columns if c not in skip and not c.startswith("_") and pd.api.types.is_numeric_dtype(df[c])]
+
+
+# -----------------------------------------------------------------------------
+# Stage-2 "sibling" features: the S2/S3 records of one business resemble each other, so a candidate
+# that looks like the entity's most confident OTHER candidates is likely a match too (and one that
+# looks like none of them is suspicious). Uses stage-1 probabilities p1 (OOF on training pairs).
+# -----------------------------------------------------------------------------
+def sibling_features(key: np.ndarray, p1: np.ndarray, t_name: np.ndarray, t_addr: np.ndarray,
+                     t_compact: np.ndarray, is_s2: np.ndarray, n_slots: int = 4) -> pd.DataFrame:
+    n = len(key)
+    order = np.lexsort((-p1, key))
+    sk = key[order]
+    starts = np.r_[0, np.flatnonzero(sk[1:] != sk[:-1]) + 1]
+    sizes = np.diff(np.r_[starts, n])
+    gid = np.repeat(np.arange(len(starts)), sizes)
+    pos = np.arange(n)
+    rank = pos - starts[gid]                                   # 0 = most probable in its group
+
+    slots = starts[gid][:, None] + np.arange(n_slots + 1)[None, :]
+    valid = (np.arange(n_slots + 1)[None, :] < sizes[gid][:, None]) & (slots != pos[:, None])
+    r_pos = np.repeat(pos, valid.sum(axis=1))
+    a_pos = slots[valid]
+    r, a = order[r_pos], order[a_pos]                          # original row ids: row, anchor
+    w = p1[a]
+
+    name_sim = process.cpdist(t_name[r], t_name[a], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
+    has_addr = pd.Series(t_addr).str.len().to_numpy() > 0
+    has_compact = pd.Series(t_compact).str.len().to_numpy() > 0
+    addr_ok = has_addr[r] & has_addr[a]
+    addr_sim = process.cpdist(t_addr[r], t_addr[a], scorer=fuzz.token_set_ratio, workers=-1, dtype=np.float32) / 100
+    addr_sim[~addr_ok] = 0.0
+    addr_eq = addr_ok & (t_addr[r] == t_addr[a])
+    comp_eq = (t_compact[r] == t_compact[a]) & has_compact[r]
+    conf = w >= 0.5
+
+    def agg_max(vals):
+        out = np.full(n, 0.0, dtype=np.float32)
+        np.maximum.at(out, r, vals.astype(np.float32))
+        return out
+
+    def agg_sum(vals):
+        return np.bincount(r, weights=vals.astype(np.float64), minlength=n).astype(np.float32)
+
+    f = {
+        "p1": p1.astype(np.float32),
+        "p1_rank": np.empty(n, dtype=np.float32),
+        "sib_name_wmax": agg_max(w * name_sim),
+        "sib_addr_wmax": agg_max(w * addr_sim),
+        "sib_name_conf_max": agg_max(np.where(conf, name_sim, 0)),
+        "sib_addr_conf_max": agg_max(np.where(conf, addr_sim, 0)),
+        "sib_addr_eq_conf": agg_sum(conf & addr_eq),
+        "sib_compact_eq_conf": agg_sum(conf & comp_eq),
+        "sib_name_hi_conf": agg_sum(conf & (name_sim >= 0.9)),
+        "sib_addr_hi_conf": agg_sum(conf & (addr_sim >= 0.9)),
+    }
+    f["p1_rank"][order] = rank + 1
+    # group-level context of p1
+    first = order[starts]                                      # most probable row of each group
+    second_p = np.where(sizes > 1, p1[order[np.minimum(starts + 1, n - 1)]], 0.0)
+    best_other = np.where(order[starts][gid] == order, second_p[gid], p1[first][gid])
+    bo = np.empty(n, dtype=np.float32)
+    bo[order] = best_other
+    f["p1_best_other"] = bo
+    f["p1_gap_best_other"] = (p1 - bo).astype(np.float32)
+    g_conf = np.bincount(gid, weights=(p1[order] >= 0.5), minlength=len(starts))
+    g_sum = np.bincount(gid, weights=p1[order], minlength=len(starts))
+    g_conf_s2 = np.bincount(gid, weights=(p1[order] >= 0.5) & is_s2[order], minlength=len(starts))
+    for name, g in [("n_conf", g_conf), ("sum_p1", g_sum), ("n_conf_s2", g_conf_s2), ("n_conf_s3", g_conf - g_conf_s2)]:
+        v = np.empty(n, dtype=np.float32)
+        v[order] = g[gid]
+        f[name] = v
+    same_src = np.where(is_s2, f["n_conf_s2"], f["n_conf_s3"]) - (p1 >= 0.5)
+    f["n_conf_same_source_other"] = same_src.astype(np.float32)
+    return pd.DataFrame(f)
+
+
+def sibling_inputs(feats: pd.DataFrame, key_col: str, p1: np.ndarray) -> pd.DataFrame:
+    return sibling_features(feats[key_col].to_numpy(), p1, feats["_t_name"].to_numpy(dtype=object),
+                            feats["_t_addr"].to_numpy(dtype=object), feats["_t_compact"].to_numpy(dtype=object),
+                            feats["is_s2"].to_numpy() > 0.5)
 
 
 # -----------------------------------------------------------------------------
@@ -206,31 +290,12 @@ LGB_PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=63, min_chi
                   subsample=0.8, subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0,
                   n_estimators=2000, random_state=42, verbose=-1, n_jobs=8)
 
-
-@dataclass
-class TrainedModel:
-    booster: lgb.LGBMClassifier
-    features: List[str]
-    decision: Dict[str, float]
-    cv: Dict[str, float] = field(default_factory=dict)
-
-    def predict(self, feats: pd.DataFrame) -> np.ndarray:
-        return self.booster.predict_proba(feats[self.features].to_numpy(np.float32))[:, 1]
-
-
 DECISION_GRID = dict(ts=np.round(np.arange(0.20, 0.91, 0.04), 2),
                      t_tops=(0.0, 0.5, 0.6, 0.7, 0.8, 0.9), rels=(0.0, 0.3, 0.5, 0.7))
 
 
-def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: int = 5,
-                t_tops=DECISION_GRID["t_tops"], rels=DECISION_GRID["rels"]):
-    """feats: training pairs with 'label', 's1_key' (0..n_s1-1, unique over countries) and 'cand_key'
-    (unique target id). n_true[s1_key] = number of true matches (including ones blocking missed).
-    Returns (TrainedModel, oof probabilities)."""
-    cols = feature_columns(feats)
-    X = feats[cols].to_numpy(np.float32)
-    y = feats["label"].to_numpy()
-    groups = feats["s1_key"].to_numpy()
+def fit_oof(X, y, groups, n_splits=5, tag=""):
+    """GroupKFold OOF probabilities + a final model on all rows (trees = 1.1 x mean best iteration)."""
     oof = np.zeros(len(y), dtype=np.float64)
     best_iters = []
     for fold, (tr, va) in enumerate(GroupKFold(n_splits=n_splits).split(X, y, groups)):
@@ -238,13 +303,57 @@ def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: in
         m.fit(X[tr], y[tr], eval_X=(X[va],), eval_y=(y[va],), callbacks=[lgb.early_stopping(100, verbose=False)])
         oof[va] = m.predict_proba(X[va])[:, 1]
         best_iters.append(m.best_iteration_)
-        log(f"  fold {fold + 1}/{n_splits}: best_iter={m.best_iteration_}")
-    params, best, _ = tune(groups, feats["cand_key"].to_numpy(), oof, y.astype(bool), n_true, n_s1,
-                           ts=DECISION_GRID["ts"], t_tops=t_tops, rels=rels)
+        log(f"  {tag} fold {fold + 1}/{n_splits}: best_iter={m.best_iteration_}")
     n_est = int(np.mean(best_iters) * 1.1)
     final = lgb.LGBMClassifier(**{**LGB_PARAMS, "n_estimators": n_est})
     final.fit(X, y)
-    cv = {"oof_macro_f05": best["macro_f05"], "oof_singleton_acc": best["singleton_accuracy"],
-          "oof_matches_f05": best["matches_macro_f05"], "n_estimators": n_est, **params}
-    log(f"  OOF macro F0.5={best['macro_f05']:.4f} with {params}; final model {n_est} trees")
-    return TrainedModel(final, cols, params, cv), oof
+    return oof, final, n_est
+
+
+@dataclass
+class TrainedModel:
+    stage1: lgb.LGBMClassifier
+    cols1: List[str]
+    stage2: Optional[lgb.LGBMClassifier]
+    cols2: List[str]
+    decision: Dict[str, float]
+    cv: Dict[str, float] = field(default_factory=dict)
+
+    def predict(self, feats: pd.DataFrame, key_col: str = "s1_idx") -> np.ndarray:
+        X1 = feats[self.cols1].to_numpy(np.float32)
+        p1 = self.stage1.predict_proba(X1)[:, 1]
+        if self.stage2 is None:
+            return p1
+        sib = sibling_inputs(feats, key_col, p1)
+        return self.stage2.predict_proba(np.hstack([X1, sib[self.cols2].to_numpy(np.float32)]))[:, 1]
+
+
+def train_model(feats: pd.DataFrame, n_true: np.ndarray, n_s1: int, n_splits: int = 5, two_stage: bool = True):
+    """feats: training pairs with 'label', 's1_key' (0..n_s1-1, unique over countries), 'cand_key'
+    (unique target id) and the _t_* target strings. n_true[s1_key] = number of true matches
+    (including ones blocking missed). The decision rule is tuned on the OOF probabilities of the
+    last stage. Returns (TrainedModel, oof probabilities)."""
+    cols1 = feature_columns(feats)
+    X1 = feats[cols1].to_numpy(np.float32)
+    y = feats["label"].to_numpy()
+    groups = feats["s1_key"].to_numpy()
+    cand = feats["cand_key"].to_numpy()
+    oof1, m1, n1 = fit_oof(X1, y, groups, n_splits, "stage1")
+    params1, best1, _ = tune(groups, cand, oof1, y.astype(bool), n_true, n_s1, ts=DECISION_GRID["ts"],
+                             t_tops=DECISION_GRID["t_tops"], rels=DECISION_GRID["rels"])
+    log(f"  stage1 OOF macro F0.5={best1['macro_f05']:.4f} singleton_acc={best1['singleton_accuracy']:.4f} with {params1}")
+    cv = {"stage1_oof_macro_f05": best1["macro_f05"], "stage1_oof_singleton_acc": best1["singleton_accuracy"]}
+    if not two_stage:
+        cv.update({"oof_macro_f05": best1["macro_f05"], "oof_singleton_acc": best1["singleton_accuracy"],
+                   "oof_matches_f05": best1["matches_macro_f05"], **params1})
+        return TrainedModel(m1, cols1, None, [], params1, cv), oof1
+    sib = sibling_inputs(feats, "s1_key", oof1)
+    cols2 = list(sib.columns)
+    X2 = np.hstack([X1, sib.to_numpy(np.float32)])
+    oof2, m2, n2 = fit_oof(X2, y, groups, n_splits, "stage2")
+    params2, best2, _ = tune(groups, cand, oof2, y.astype(bool), n_true, n_s1, ts=DECISION_GRID["ts"],
+                             t_tops=DECISION_GRID["t_tops"], rels=DECISION_GRID["rels"])
+    log(f"  stage2 OOF macro F0.5={best2['macro_f05']:.4f} singleton_acc={best2['singleton_accuracy']:.4f} with {params2}")
+    cv.update({"oof_macro_f05": best2["macro_f05"], "oof_singleton_acc": best2["singleton_accuracy"],
+               "oof_matches_f05": best2["matches_macro_f05"], "n_estimators": [n1, n2], **params2})
+    return TrainedModel(m1, cols1, m2, cols2, params2, cv), oof2
