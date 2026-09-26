@@ -1,9 +1,12 @@
 """
-Stage 1: Normalization module.
-Handles:
-- P1-3: Rule-based Indic script transliteration to Latin (Devanagari, Tamil, Telugu, etc.)
-- P2-1 & P2-2: Exact legal-form stripping (including French forms eurl, sasu, sci, ei, snc)
-- P2-3, P2-4, P2-5: House/plot number isolation, address component tokenization, landmark handling, and addr_missing flag.
+Stage 1: normalization of names and addresses (all countries, no country-specific branches).
+- Indic scripts (Devanagari, Bengali, Gujarati, Tamil, Telugu, Kannada, Malayalam, ...) are
+  transliterated to Latin with our own rule table.
+- Accents stripped, apostrophes joined, website parts / junk ids / leading zeros removed.
+- name_core: name without true legal forms (incl. French SARL/SAS/EURL/SASU/SCI/EI);
+  name_compact: name_core without spaces.
+- Addresses: abbreviations expanded, house/plot number extracted from any comma component,
+  commas kept for component features. (A landmark phrase is also extracted but is not used.)
 """
 
 import re
