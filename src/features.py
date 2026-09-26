@@ -79,7 +79,7 @@ def _safe_div(a, b):
 class Records:
     """Column arrays + string lengths of a normalized frame, computed once. Building these per call
     for a 4-6M record pool was the main per-chunk cost of test inference."""
-    COLS = ("entity_id", "name_norm", "name_core", "name_compact", "addr_norm", "house_number")
+    COLS = ("entity_id", "name_norm", "name_core", "name_compact", "addr_norm", "house_number", "addr_key", "name_key")
 
     def __init__(self, df: pd.DataFrame):
         self.obj = {c: df[c].to_numpy(dtype=object) for c in self.COLS if c in df}

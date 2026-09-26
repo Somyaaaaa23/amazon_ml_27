@@ -29,7 +29,7 @@ from rapidfuzz import fuzz, process
 from src.features import Records, TokenSpace, add_group_features, pair_features
 from src.normalization import preprocess_dataframe
 
-NORM_COLS = ["entity_id", "country", "name_norm", "name_core", "name_compact", "addr_norm", "house_number"]
+NORM_COLS = ["entity_id", "country", "name_norm", "name_core", "name_compact", "addr_norm", "house_number"]  # + addr_key, name_key
 T0 = time.time()
 
 
@@ -40,9 +40,17 @@ def log(msg):
 # -----------------------------------------------------------------------------
 # Normalization
 # -----------------------------------------------------------------------------
+def _sorted_key(text: str) -> str:
+    return " ".join(sorted(set(text.replace(",", " ").split())))
+
+
 def _norm_chunk(df):
     out = preprocess_dataframe(df)
-    return out[NORM_COLS].assign(combined=out["name_norm"] + " " + out["addr_norm"].str.replace(",", " ", regex=False))
+    out = out[NORM_COLS].assign(combined=out["name_norm"] + " " + out["addr_norm"].str.replace(",", " ", regex=False))
+    # order-invariant keys: "BIG LAKE, MN, 1373 MANITOU ST" == "1373 MANITOU ST, BIG LAKE, MN"
+    out["addr_key"] = [_sorted_key(a) for a in out["addr_norm"]]
+    out["name_key"] = [_sorted_key(n) for n in out["name_core"]]
+    return out
 
 
 def normalize(df: pd.DataFrame, workers: int = 6, chunk: int = 100_000) -> pd.DataFrame:
@@ -126,8 +134,9 @@ class CountryIndex:
         # exact-twin groups for sibling expansion (records of one business often share the exact
         # normalized address or compact name); large groups are generic and skipped
         self.expand = expand
-        self.addr_groups = _twin_groups(self.pool["addr_norm"], min_len=8)
+        self.addr_groups = _twin_groups(self.pool["addr_key"], min_len=10)
         self.compact_groups = _twin_groups(self.pool["name_compact"], min_len=6)
+        self.namekey_groups = _twin_groups(self.pool["name_key"], min_len=6)
 
     def _query_batch(self, Q: Dict[str, sp.csr_matrix], lo: int, hi: int):
         """Top-k of every view, unioned per S1; the cosine of every view for every union member is
@@ -209,7 +218,7 @@ class CountryIndex:
         anchor = (name_ts >= 90) & (addr_ts >= 80)
         sa, ta = s_idx[anchor], t_idx[anchor]
         new_s, new_t = [], []
-        for codes, (order, ptr) in [(self.addr_groups[0], self.addr_groups[1:]), (self.compact_groups[0], self.compact_groups[1:])]:
+        for codes, order, ptr in [self.addr_groups, self.compact_groups, self.namekey_groups]:
             c = codes[ta]
             ok = c >= 0
             if not ok.any():
@@ -330,7 +339,8 @@ def build_features(index: CountryIndex, s1: pd.DataFrame, pairs: pd.DataFrame, c
     feats = pd.concat([pairs] + [pd.concat(out)], axis=1) if out else pairs
     cos_cols = [c for c in pairs.columns if c.startswith("cos_")]
     t = feats["t_idx"].to_numpy()
-    for col, src in [("_t_name", "name_norm"), ("_t_addr", "addr_norm"), ("_t_compact", "name_compact")]:
+    for col, src in [("_t_name", "name_norm"), ("_t_addr", "addr_norm"), ("_t_compact", "name_compact"),
+                     ("_t_addrkey", "addr_key"), ("_t_namekey", "name_key"), ("_t_hn", "house_number")]:
         feats[col] = index.rec.obj[src][t]
     feats["cos_max"] = feats[cos_cols].max(axis=1)
     feats["cos_mean"] = feats[cos_cols].mean(axis=1)
@@ -356,7 +366,9 @@ def feature_columns(df: pd.DataFrame) -> List[str]:
 # looks like none of them is suspicious). Uses stage-1 probabilities p1 (OOF on training pairs).
 # -----------------------------------------------------------------------------
 def sibling_features(key: np.ndarray, p1: np.ndarray, t_name: np.ndarray, t_addr: np.ndarray,
-                     t_compact: np.ndarray, is_s2: np.ndarray, n_slots: int = 4) -> pd.DataFrame:
+                     t_compact: np.ndarray, is_s2: np.ndarray, n_slots: int = 4,
+                     t_addrkey: Optional[np.ndarray] = None, t_namekey: Optional[np.ndarray] = None,
+                     t_hn: Optional[np.ndarray] = None) -> pd.DataFrame:
     n = len(key)
     order = np.lexsort((-p1, key))
     sk = key[order]
@@ -403,6 +415,15 @@ def sibling_features(key: np.ndarray, p1: np.ndarray, t_name: np.ndarray, t_addr
         "sib_name_hi_conf": agg_sum(conf & (name_sim >= 0.9)),
         "sib_addr_hi_conf": agg_sum(conf & (addr_sim >= 0.9)),
     }
+    for name, arr in [("addrkey", t_addrkey), ("namekey", t_namekey), ("hn", t_hn)]:
+        if arr is None:
+            continue
+        ok = pd.Series(arr).str.len().to_numpy() > 0
+        eq = ok[r] & ok[a] & (arr[r] == arr[a])
+        f[f"sib_{name}_eq_conf"] = agg_sum(conf & eq)
+        f[f"sib_{name}_eq_wmax"] = agg_max(w * eq)
+        if name == "hn":   # house number differs from a confident sibling that has one
+            f["sib_hn_conflict_conf"] = agg_sum(conf & ok[r] & ok[a] & (arr[r] != arr[a]))
     f["p1_rank"][order] = rank + 1
     # group-level context of p1
     first = order[starts]                                      # most probable row of each group
@@ -425,9 +446,11 @@ def sibling_features(key: np.ndarray, p1: np.ndarray, t_name: np.ndarray, t_addr
 
 
 def sibling_inputs(feats: pd.DataFrame, key_col: str, p1: np.ndarray) -> pd.DataFrame:
+    opt = lambda c: feats[c].to_numpy(dtype=object) if c in feats else None
     return sibling_features(feats[key_col].to_numpy(), p1, feats["_t_name"].to_numpy(dtype=object),
                             feats["_t_addr"].to_numpy(dtype=object), feats["_t_compact"].to_numpy(dtype=object),
-                            feats["is_s2"].to_numpy() > 0.5)
+                            feats["is_s2"].to_numpy() > 0.5, t_addrkey=opt("_t_addrkey"),
+                            t_namekey=opt("_t_namekey"), t_hn=opt("_t_hn"))
 
 
 # -----------------------------------------------------------------------------
