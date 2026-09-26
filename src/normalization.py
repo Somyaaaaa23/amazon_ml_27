@@ -194,6 +194,21 @@ ADDRESS_ABBREVIATIONS = {
     r"\bcrs\b": "cours",
 }
 
+# Digit-for-letter noise inside name words ("K0lkata", "5hree", "Ni1giri", "Bui1ding", "6PZ").
+# Only words with at least two letters are touched, and ordinals ("4th", "21st") never.
+_DIGIT_AS_LETTER = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "6": "g", "8": "b"})
+_ORDINAL = re.compile(r"^\d+(?:st|nd|rd|th)$")
+
+
+def _fix_digit_letters(text: str) -> str:
+    out = []
+    for w in text.split():
+        if (any(ch.isdigit() for ch in w) and sum(ch.isalpha() for ch in w) >= 2 and not _ORDINAL.match(w)):
+            w = w.translate(_DIGIT_AS_LETTER)
+        out.append(w)
+    return " ".join(out)
+
+
 # Zero-padded numbers ("0031" vs "31", "Building No. 0253") are noise, not a different number
 _LEADING_ZEROS = re.compile(r"(?<!\d)0+(?=\d)")
 # Website-style names ("highlandintelligence.com", "www.gilddova.com") and junk ids in names
@@ -250,6 +265,8 @@ def normalize_name(raw_name: str) -> Tuple[str, str]:
     text = re.sub(r"\s*&\s*", " and ", text)
     text = re.sub(r"[\/\+\@]", " ", text)
     text = re.sub(r"[^\w\s]", " ", text)
+
+    text = _fix_digit_letters(text)
 
     # Expand abbreviations
     for pattern, replacement in NAME_ABBREVIATIONS.items():

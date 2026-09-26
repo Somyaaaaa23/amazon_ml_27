@@ -38,7 +38,7 @@ def pools_by_country(s2, s3, countries):
     return {c: pd.concat([s2[s2["country"] == c], s3[s3["country"] == c]], ignore_index=True) for c in countries}
 
 
-def train(train_dir, n_train, prune_k=None, rival_drop=0.0, hop2=False, seed=0):
+def train(train_dir, n_train, prune_k=None, rival_drop=0.0, hop2=False, views=None, seed=0):
     s1, s2, s3 = (read(os.path.join(train_dir, f"train_source{i}.tsv")) for i in (1, 2, 3))
     gt_df = pd.read_csv(os.path.join(train_dir, "train_ground_truth.tsv"), sep="\t", dtype=str, keep_default_na=False)
     gt = {k: [x for x in v.split(",") if x] for k, v in zip(gt_df["source1_entity_id"], gt_df["matched_entity_ids"])}
@@ -54,7 +54,7 @@ def train(train_dir, n_train, prune_k=None, rival_drop=0.0, hop2=False, seed=0):
     for c in sorted(pools, key=lambda c: len(pools[c])):
         pool = pc.normalize(pools.pop(c))
         tr_c = tr_n[tr_n["country"] == c].reset_index(drop=True)
-        idx = pc.CountryIndex(pool, extra=[tr_c], hop2=hop2)
+        idx = pc.CountryIndex(pool, extra=[tr_c], hop2=hop2, views=views)
         # rival pool: the country's training S1, minus a random share of the non-sampled ones to
         # simulate the test set (where ~20% of businesses have S2/S3 records but no S1 entity)
         s1c = s1_by_c.pop(c)
@@ -80,7 +80,7 @@ def train(train_dir, n_train, prune_k=None, rival_drop=0.0, hop2=False, seed=0):
     return model
 
 
-def predict_test(model, test_dir, output_dir, chunk, hop2=False):
+def predict_test(model, test_dir, output_dir, chunk, hop2=False, views=None):
     s1, s2, s3 = (read(os.path.join(test_dir, f"test_source{i}.tsv")) for i in (1, 2, 3))
     n_s1 = len(s1)
     log(f"test S1 {n_s1:,} {s1['country'].value_counts(dropna=False).to_dict()}")
@@ -97,7 +97,7 @@ def predict_test(model, test_dir, output_dir, chunk, hop2=False):
         log(f"test [{c}]: {len(s1_c):,} S1, pool {len(pool):,}; building index")
         if pool.empty:
             continue
-        idx = pc.CountryIndex(pool, extra=[s1_c], hop2=hop2)
+        idx = pc.CountryIndex(pool, extra=[s1_c], hop2=hop2, views=views)
         rivals = pc.RivalIndex(s1_c)                             # every test S1 of the country
         pool_ids = idx.pool["entity_id"].to_numpy()
         S, T, P = [], [], []
@@ -155,11 +155,13 @@ def main():
     ap.add_argument("--prune-k", type=int, default=None, help="stage 1 keeps the top-k candidates per S1 for the final model")
     ap.add_argument("--rival-drop", type=float, default=0.0, help="share of non-sampled training S1 left out of the rival pool")
     ap.add_argument("--hop2", action="store_true", help="second-hop retrieval from confident candidates")
+    ap.add_argument("--views", default="default", help="blocking view set (pipeline_core.VIEW_SETS)")
     args = ap.parse_args()
+    views = pc.VIEW_SETS[args.views]
 
-    model = train(args.train_dir, args.n_train, args.prune_k, args.rival_drop, args.hop2)
+    model = train(args.train_dir, args.n_train, args.prune_k, args.rival_drop, args.hop2, views)
     log(f"model: decision {model.decision}, OOF {model.cv}")
-    match_path, cand_path = predict_test(model, args.test_dir, args.output_dir, args.chunk, args.hop2)
+    match_path, cand_path = predict_test(model, args.test_dir, args.output_dir, args.chunk, args.hop2, views)
     validator = os.path.join(PROJECT_ROOT, "student_resource", "utils", "validate_submission.py")
     r = subprocess.run([sys.executable, validator, "--matching", match_path, "--candidate", cand_path, "--test-dir", args.test_dir])
     log("VALIDATOR PASS" if r.returncode == 0 else "VALIDATOR FAIL")

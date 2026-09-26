@@ -82,6 +82,11 @@ DEFAULT_VIEWS = [
     View("comb", "combined", "word", (1, 1), 0.01, 40),
     View("name", "name_norm", "word", (1, 1), 0.01, 15),
 ]
+# + character 3-grams of the name: tolerates typos ("Mfedia", "Endccorinology") that word views miss
+VIEW_SETS = {
+    "default": DEFAULT_VIEWS,
+    "charname": DEFAULT_VIEWS + [View("cname", "name_norm", "char_wb", (3, 3), 0.01, 15)],
+}
 
 
 _QFN = None

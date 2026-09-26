@@ -334,7 +334,7 @@ def adapter_antigravity(mods, s1, s2, s3, gt, tr, ev, top_k=20, qbatch=25):
 def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
     """data: {"s2": df, "s3": df}; emptied once the per-country pools are built (frees ~4 GB)."""
     pc = mods["pipeline_core"]
-    views = kw.get("views")
+    views = getattr(pc, "VIEW_SETS", {}).get(kw.get("views") or "default")
     tr_n, ev_n = pc.normalize(tr), pc.normalize(ev)
     tr_key = {k: i for i, k in enumerate(tr_n["entity_id"])}
     train_parts, eval_parts = [], []
@@ -438,6 +438,8 @@ def append_results(name, args, res, cv_info, minutes):
             tr_desc += f" (top-{args.prune_k})"
         if getattr(args, "hop2", False):
             tr_desc += " (hop2)"
+        if getattr(args, "views", "default") != "default":
+            tr_desc += f" (views={args.views})"
         cv_txt = f"{cv_info.get('cv_macro_f05', float('nan')):.4f}" if cv_info else "-"
         for scope, r in res.items():
             f.write(f"| {name} | {args.adapter} | {tr_desc} | {scope} | {r['recall_ceiling']*100:.2f}% | {r['avg_cands']:.1f} | "
@@ -457,6 +459,7 @@ def main():
     ap.add_argument("--no-results-md", action="store_true", help="smoke tests: do not append to RESULTS.md")
     ap.add_argument("--prune-k", type=int, default=None, help="current adapter: stage-1 top-k filter before the final model")
     ap.add_argument("--hop2", action="store_true", help="second-hop retrieval from confident candidates")
+    ap.add_argument("--views", default="default", help="blocking view set (pipeline_core.VIEW_SETS)")
     ap.add_argument("--rival-drop-train", type=float, default=0.0, help="share of other S1 removed from the rival pool when building training features")
     ap.add_argument("--rival-drop-eval", type=float, default=0.0, help="same for evaluation features (0.2 ~ test conditions)")
     ap.add_argument("--smoke-pool-frac", type=float, default=None,
@@ -487,7 +490,7 @@ def main():
         del s2, s3, s1
         cands, preds, cv_info = adapter_current(mods, None, data, None, gt, tr, ev, prune_k=args.prune_k,
                                                 rival_drop_train=args.rival_drop_train, rival_drop_eval=args.rival_drop_eval,
-                                                hop2=args.hop2)
+                                                hop2=args.hop2, views=args.views)
     else:
         del s1
         cands, preds, cv_info = ADAPTERS[args.adapter](mods, None, s2, s3, gt, tr, ev)
