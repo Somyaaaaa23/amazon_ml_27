@@ -43,6 +43,7 @@ def train(train_dir, n_train, prune_k=None, rival_drop=0.0, hop2=False, views=No
     gt_df = pd.read_csv(os.path.join(train_dir, "train_ground_truth.tsv"), sep="\t", dtype=str, keep_default_na=False)
     gt = {k: [x for x in v.split(",") if x] for k, v in zip(gt_df["source1_entity_id"], gt_df["matched_entity_ids"])}
     assert set(s1["entity_id"]) <= set(gt), "ground truth does not cover all training S1"
+    log(f"Indic word map: {pc.learn_token_map(s1, [s2, s3], gt):,} words learned from the training ground truth")
     tr = s1.groupby("country", group_keys=False).sample(frac=min(1.0, n_train / len(s1)), random_state=seed)
     tr_n = pc.normalize(tr)
     log(f"train S1: {len(tr_n):,} {tr_n['country'].value_counts().to_dict()}")

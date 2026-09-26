@@ -335,6 +335,12 @@ def adapter_current(mods, s1, data, _unused, gt, tr, ev, **kw):
     """data: {"s2": df, "s3": df}; emptied once the per-country pools are built (frees ~4 GB)."""
     pc = mods["pipeline_core"]
     views = getattr(pc, "VIEW_SETS", {}).get(kw.get("views") or "default")
+    if hasattr(pc, "learn_token_map") and data.get("s1") is not None:
+        # learned only from the training side of the split (and the training countries)
+        s1_all = data["s1"]
+        teach = s1_all[~s1_all["entity_id"].map(is_holdout) & s1_all["country"].isin(set(tr["country"]))]
+        n_map = pc.learn_token_map(teach, [data["s2"], data["s3"]], gt)
+        log(f"current: Indic word map {n_map:,} words, learned from {len(teach):,} training-side S1")
     tr_n, ev_n = pc.normalize(tr), pc.normalize(ev)
     tr_key = {k: i for i, k in enumerate(tr_n["entity_id"])}
     train_parts, eval_parts = [], []

@@ -1,7 +1,8 @@
 """
 Stage 1: normalization of names and addresses (all countries, no country-specific branches).
-- Indic scripts (Devanagari, Bengali, Gujarati, Tamil, Telugu, Kannada, Malayalam, ...) are
-  transliterated to Latin with our own rule table.
+- Indic scripts (Devanagari, Bengali, Gujarati, Tamil, Telugu, Kannada, Malayalam, ...): words of
+  names go through a word map learned from the training ground truth (learn_token_map /
+  set_token_map); everything else is transliterated to Latin with our own rule table.
 - Accents stripped, apostrophes joined, website parts / junk ids / leading zeros removed.
 - name_core: name without true legal forms (incl. French SARL/SAS/EURL/SASU/SCI/EI);
   name_compact: name_core without spaces.
@@ -53,6 +54,55 @@ _PRA_LI = re.compile(r"\bpra\.?\s*li\b\.?")
 
 def _is_brahmic(ch: str) -> bool:
     return 0x0900 <= ord(ch) <= 0x0D7F
+
+
+# -----------------------------------------------------------------------------
+# Learned word map for Indic-script names (from the training ground truth only)
+# -----------------------------------------------------------------------------
+# Indic-script names are word-by-word renderings of an English name ("लाइफ इंडस्ट्रीज प्राइवेट
+# लिमिटेड" = "Life Industries Private Limited"). Aligning them with their S1 names gives each
+# Indic word its English word; rule-based transliteration is only the fallback for unseen words.
+_MAP_TOKEN = re.compile(r"[^\s,.\-()\[\]/&+]+")
+_BRAHMIC_RE = "[ऀ-ൿ]"
+_TOKEN_MAP: Dict[str, str] = {}
+
+
+def set_token_map(mapping: Dict[str, str]) -> None:
+    global _TOKEN_MAP
+    _TOKEN_MAP = dict(mapping)
+
+
+def apply_token_map(text: str) -> str:
+    if not _TOKEN_MAP or not any(_is_brahmic(c) for c in text):
+        return text
+    return _MAP_TOKEN.sub(lambda m: _TOKEN_MAP.get(m.group(0), m.group(0)), text)
+
+
+def learn_token_map(s1_names: Dict[str, str], pool_ids: pd.Series, pool_names: pd.Series,
+                    gt: Dict[str, List[str]], min_count: int = 2, min_share: float = 0.5) -> Dict[str, str]:
+    """s1_names: {S1 id: raw name} of the S1 entities allowed to teach; gt: {S1 id: matched ids}.
+    A pool name containing Indic script is aligned with its S1 name when both have the same number
+    of words; each Indic word keeps its most frequent English word (>= min_count, >= min_share)."""
+    owner = {t: k for k, v in gt.items() if k in s1_names for t in v}
+    has = pool_names.fillna("").str.contains(_BRAHMIC_RE).to_numpy()
+    counts: Dict[str, Dict[str, int]] = {}
+    for e, n in zip(pool_ids.to_numpy()[has], pool_names.to_numpy()[has]):
+        k = owner.get(e)
+        if k is None:
+            continue
+        a, b = _MAP_TOKEN.findall(n), _MAP_TOKEN.findall(s1_names[k].lower())
+        if len(a) != len(b):
+            continue
+        for x, y in zip(a, b):
+            if any(_is_brahmic(c) for c in x) and not any(_is_brahmic(c) for c in y):
+                d = counts.setdefault(x, {})
+                d[y] = d.get(y, 0) + 1
+    out = {}
+    for x, d in counts.items():
+        y = max(d, key=d.get)
+        if d[y] >= min_count and d[y] >= min_share * sum(d.values()):
+            out[x] = y
+    return out
 
 
 def transliterate_indic(text: str) -> str:
@@ -251,8 +301,8 @@ def normalize_name(raw_name: str) -> Tuple[str, str]:
     if pd.isna(raw_name) or not raw_name:
         return "", ""
 
-    # Transliterate Indic scripts first
-    text = transliterate_indic(str(raw_name))
+    # Indic scripts first: learned word map, then rule-based transliteration for the rest
+    text = transliterate_indic(apply_token_map(str(raw_name)))
     text = strip_accents(text).lower()
 
     # Apostrophes join rather than split ("Orelee's" -> "orelees")

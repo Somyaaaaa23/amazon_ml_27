@@ -4,6 +4,7 @@ inference (src/infer_test.py). Everything works per country: the country label i
 partition records (the training data has no cross-country matches), never as a feature, so an
 unseen country (France) simply gets its own index fitted on its own text.
 
+  learn_token_map() -> Indic-word -> English-word map from the training ground truth
   normalize()      -> normalized frame (parallel)
   CountryIndex     -> per-country TF-IDF blocking views, fitted on that country's pool + S1 text
   CountryIndex.candidates() -> candidate pairs with the cosine of EVERY view
@@ -27,6 +28,7 @@ from sklearn.model_selection import GroupKFold
 from src.decision import decide, macro_f05_arrays, one_owner, tune
 from rapidfuzz import fuzz, process
 from src.features import Records, TokenSpace, add_group_features, pair_features
+from src import normalization as nz
 from src.normalization import preprocess_dataframe
 
 # forked workers for blocking queries (they share the index copy-on-write); override with ER_BLOCK_WORKERS
@@ -53,6 +55,16 @@ def _norm_chunk(df):
     out["addr_key"] = [_sorted_key(a) for a in out["addr_norm"]]
     out["name_key"] = [_sorted_key(n) for n in out["name_core"]]
     return out
+
+
+def learn_token_map(s1: pd.DataFrame, pools: Sequence[pd.DataFrame], gt: Dict[str, List[str]]) -> int:
+    """Learn the Indic-word -> English-word map from these (training) S1 entities and their ground
+    truth, and install it for every later normalize() call. Returns the map size."""
+    s1_names = dict(zip(s1["entity_id"], s1["business_name"].fillna("")))
+    pool = pd.concat([p[["entity_id", "business_name"]] for p in pools], ignore_index=True)
+    mapping = nz.learn_token_map(s1_names, pool["entity_id"], pool["business_name"], gt)
+    nz.set_token_map(mapping)
+    return len(mapping)
 
 
 def normalize(df: pd.DataFrame, workers: int = 6, chunk: int = 100_000) -> pd.DataFrame:
